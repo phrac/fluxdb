@@ -1,0 +1,33 @@
+[Unit]
+Description=FluxDB document-oriented NoSQL database
+After=network.target
+Documentation=https://github.com/phrac/fluxdb
+
+[Service]
+Type=simple
+User=fluxdb
+Group=fluxdb
+ExecStart=/usr/local/bin/fluxdb -c /etc/fluxdb/fluxdb.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# Data and config paths
+WorkingDirectory=/var/lib/fluxdb
+ReadWritePaths=/var/lib/fluxdb
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
