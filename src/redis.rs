@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::database::Database;
 
@@ -14,30 +15,79 @@ use crate::database::Database;
 /// - SELECT: switch the active collection
 /// - KEYS/EXISTS/DBSIZE: query key space
 /// - PING/INFO/COMMAND: server management
+/// - AUTH: token-based authentication
 pub struct RedisServer {
     db: Arc<Database>,
     addr: String,
+    max_connections: usize,
+    auth_token: Option<String>,
+    max_bulk_bytes: usize,
+    max_array_len: usize,
 }
 
 impl RedisServer {
-    pub fn new(db: Arc<Database>, addr: String) -> Self {
-        RedisServer { db, addr }
+    pub fn new(
+        db: Arc<Database>,
+        addr: String,
+        max_connections: usize,
+        auth_token: Option<String>,
+        max_bulk_bytes: usize,
+        max_array_len: usize,
+    ) -> Self {
+        RedisServer {
+            db,
+            addr,
+            max_connections,
+            auth_token,
+            max_bulk_bytes,
+            max_array_len,
+        }
     }
 
-    pub async fn run(&self) -> crate::error::Result<()> {
+    pub async fn run(&self, shutdown: &mut tokio::sync::broadcast::Receiver<()>) -> crate::error::Result<()> {
         let listener = TcpListener::bind(&self.addr).await?;
         eprintln!("FluxDB Redis-compatible server on {}", self.addr);
 
+        let max_conn = if self.max_connections > 0 {
+            self.max_connections
+        } else {
+            usize::MAX >> 1
+        };
+        let semaphore = Arc::new(Semaphore::new(max_conn));
+
         loop {
-            let (stream, peer) = listener.accept().await?;
-            eprintln!("Redis client connected: {peer}");
-            let db = Arc::clone(&self.db);
-            tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, db).await {
-                    eprintln!("Redis client error: {e}");
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, peer) = result?;
+                    let permit = match semaphore.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            eprintln!("Redis connection limit reached, rejecting {peer}");
+                            let stream = stream;
+                            let _ = stream.try_write(b"-ERR too many connections\r\n");
+                            continue;
+                        }
+                    };
+
+                    eprintln!("Redis client connected: {peer}");
+                    let db = Arc::clone(&self.db);
+                    let auth_token = self.auth_token.clone();
+                    let max_bulk = self.max_bulk_bytes;
+                    let max_array = self.max_array_len;
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client(stream, db, auth_token, max_bulk, max_array).await {
+                            eprintln!("Redis client error: {e}");
+                        }
+                        drop(permit);
+                    });
                 }
-            });
+                _ = shutdown.recv() => {
+                    eprintln!("Redis server shutting down...");
+                    break;
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -94,14 +144,21 @@ impl RespValue {
 
 // ── RESP parser ─────────────────────────────────────────────────────────────
 
-fn read_resp<R: AsyncBufReadExt + AsyncReadExt + Unpin + Send>(
-    reader: &mut R,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Option<RespValue>>> + Send + '_>> {
-    Box::pin(read_resp_inner(reader))
+struct RespLimits {
+    max_bulk_bytes: usize,
+    max_array_len: usize,
+}
+
+fn read_resp<'a, R: AsyncBufReadExt + AsyncReadExt + Unpin + Send + 'a>(
+    reader: &'a mut R,
+    limits: &'a RespLimits,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Option<RespValue>>> + Send + 'a>> {
+    Box::pin(read_resp_inner(reader, limits))
 }
 
 async fn read_resp_inner<R: AsyncBufReadExt + AsyncReadExt + Unpin + Send>(
     reader: &mut R,
+    limits: &RespLimits,
 ) -> std::io::Result<Option<RespValue>> {
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
@@ -121,28 +178,47 @@ async fn read_resp_inner<R: AsyncBufReadExt + AsyncReadExt + Unpin + Send>(
         b'+' => Ok(Some(RespValue::SimpleString(body.to_string()))),
         b'-' => Ok(Some(RespValue::Error(body.to_string()))),
         b':' => {
-            let n: i64 = body.parse().unwrap_or(0);
+            let n: i64 = body.parse().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid RESP integer")
+            })?;
             Ok(Some(RespValue::Integer(n)))
         }
         b'$' => {
-            let len: i64 = body.parse().unwrap_or(-1);
+            let len: i64 = body.parse().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid RESP bulk string length")
+            })?;
             if len < 0 {
                 return Ok(Some(RespValue::BulkString(None)));
             }
             let len = len as usize;
+            if len > limits.max_bulk_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("RESP bulk string size {len} exceeds limit {}", limits.max_bulk_bytes),
+                ));
+            }
             let mut buf = vec![0u8; len + 2]; // +2 for \r\n
             reader.read_exact(&mut buf).await?;
             buf.truncate(len);
             Ok(Some(RespValue::BulkString(Some(buf))))
         }
         b'*' => {
-            let count: i64 = body.parse().unwrap_or(-1);
+            let count: i64 = body.parse().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid RESP array count")
+            })?;
             if count < 0 {
                 return Ok(Some(RespValue::Array(None)));
             }
-            let mut items = Vec::with_capacity(count as usize);
+            let count = count as usize;
+            if count > limits.max_array_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("RESP array count {count} exceeds limit {}", limits.max_array_len),
+                ));
+            }
+            let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                match read_resp(reader).await? {
+                match read_resp(reader, limits).await? {
                     Some(v) => items.push(v),
                     None => return Ok(None),
                 }
@@ -183,18 +259,33 @@ fn resp_to_args(value: RespValue) -> Option<Vec<Vec<u8>>> {
 async fn handle_client(
     stream: TcpStream,
     db: Arc<Database>,
+    auth_token: Option<String>,
+    max_bulk: usize,
+    max_array: usize,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut collection = "default".to_string();
+    let mut authenticated = auth_token.is_none();
+    let limits = RespLimits {
+        max_bulk_bytes: max_bulk,
+        max_array_len: max_array,
+    };
 
     // Auto-create the default collection
     let _ = db.create_collection("default");
 
     loop {
-        let value = match read_resp(&mut reader).await? {
-            Some(v) => v,
-            None => break, // client disconnected
+        let value = match read_resp(&mut reader, &limits).await {
+            Ok(Some(v)) => v,
+            Ok(None) => break, // client disconnected
+            Err(e) => {
+                // Protocol error (e.g. oversized bulk string)
+                let resp = RespValue::err(format!("protocol error: {e}"));
+                writer.write_all(&resp.serialize()).await?;
+                writer.flush().await?;
+                break; // Close connection on protocol violation
+            }
         };
 
         let args = match resp_to_args(value) {
@@ -205,12 +296,52 @@ async fn handle_client(
             }
         };
 
-        let cmd = String::from_utf8_lossy(&args[0]).to_uppercase();
+        let cmd = match std::str::from_utf8(&args[0]) {
+            Ok(s) => s.to_uppercase(),
+            Err(_) => {
+                writer.write_all(&RespValue::err("invalid UTF-8 in command").serialize()).await?;
+                continue;
+            }
+        };
+
+        // Handle AUTH before anything else
+        if cmd == "AUTH" {
+            if auth_token.is_none() {
+                writer.write_all(&RespValue::err("Client sent AUTH, but no password is set").serialize()).await?;
+            } else if args.len() < 2 {
+                writer.write_all(&RespValue::err("wrong number of arguments for 'auth' command").serialize()).await?;
+            } else {
+                let token = String::from_utf8_lossy(&args[1]);
+                if Some(token.as_ref()) == auth_token.as_deref() {
+                    authenticated = true;
+                    writer.write_all(&RespValue::ok().serialize()).await?;
+                } else {
+                    writer.write_all(&RespValue::err("invalid password").serialize()).await?;
+                }
+            }
+            writer.flush().await?;
+            continue;
+        }
+
+        // Allow PING and QUIT without auth
+        if !authenticated && cmd != "PING" && cmd != "QUIT" {
+            writer.write_all(&RespValue::err("NOAUTH Authentication required.").serialize()).await?;
+            writer.flush().await?;
+            continue;
+        }
+
         let is_quit = cmd == "QUIT";
 
         // Handle SELECT locally (needs to update connection state)
         if cmd == "SELECT" && args.len() >= 2 {
-            let new_col = String::from_utf8_lossy(&args[1]).to_string();
+            let new_col = match std::str::from_utf8(&args[1]) {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    writer.write_all(&RespValue::err("invalid UTF-8 in collection name").serialize()).await?;
+                    writer.flush().await?;
+                    continue;
+                }
+            };
             let _ = db.create_collection(&new_col);
             collection = new_col;
             writer.write_all(&RespValue::ok().serialize()).await?;

@@ -1,6 +1,7 @@
 use std::fs;
 
 use clap::Parser;
+use tokio::sync::broadcast;
 
 use fluxdb::config::{Cli, Config};
 use fluxdb::server::Server;
@@ -36,6 +37,12 @@ async fn main() {
         "WAL batch:      {} entries / {} bytes",
         config.wal.batch_size, config.wal.batch_bytes
     );
+    if config.limits.max_connections > 0 {
+        eprintln!("Max connections: {}", config.limits.max_connections);
+    }
+    if config.auth.enabled {
+        eprintln!("Authentication: enabled");
+    }
 
     #[cfg(feature = "cluster")]
     if config.cluster.enabled {
@@ -55,22 +62,62 @@ async fn main() {
         }
     };
 
+    // Create shutdown broadcast channel
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
     // Optionally start the Redis-compatible protocol server
     #[cfg(feature = "redis")]
     if config.redis.enabled {
         let redis_addr = config.redis.listen.clone();
         let db = server.db();
+        let max_connections = server.max_connections();
+        let auth_token = server.auth_token().map(String::from);
+        let max_bulk = config.limits.max_resp_bulk_bytes;
+        let max_array = config.limits.max_resp_array_len;
+        let mut redis_shutdown = shutdown_tx.subscribe();
         eprintln!("Redis protocol: {}", redis_addr);
         tokio::spawn(async move {
-            let redis_server = fluxdb::redis::RedisServer::new(db, redis_addr);
-            if let Err(e) = redis_server.run().await {
+            let redis_server = fluxdb::redis::RedisServer::new(
+                db,
+                redis_addr,
+                max_connections,
+                auth_token,
+                max_bulk,
+                max_array,
+            );
+            if let Err(e) = redis_server.run(&mut redis_shutdown).await {
                 eprintln!("Redis server error: {e}");
             }
         });
     }
 
-    if let Err(e) = server.run().await {
-        eprintln!("Server error: {e}");
-        std::process::exit(1);
+    // Spawn the main server with a shutdown receiver
+    let shutdown_rx = shutdown_tx.subscribe();
+    let db = server.db();
+
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = server.run(shutdown_rx).await {
+            eprintln!("Server error: {e}");
+        }
+    });
+
+    // Wait for shutdown signal
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\nReceived Ctrl+C, shutting down gracefully...");
+        }
+        _ = server_handle => {
+            // Server exited on its own
+        }
     }
+
+    // Signal all tasks to shut down
+    let _ = shutdown_tx.send(());
+
+    // Flush WAL before exit
+    eprintln!("Flushing WAL...");
+    if let Err(e) = db.flush() {
+        eprintln!("WARNING: Failed to flush WAL: {e}");
+    }
+    eprintln!("Shutdown complete.");
 }

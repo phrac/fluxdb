@@ -37,6 +37,21 @@ pub enum FluxError {
 
     #[error("cluster error: {0}")]
     ClusterError(String),
+
+    #[error("resource limit exceeded: {0}")]
+    ResourceLimit(String),
+
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
+    #[error("authentication required")]
+    Unauthorized,
+
+    #[error("operation timed out")]
+    Timeout,
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, FluxError>;

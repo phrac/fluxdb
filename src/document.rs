@@ -37,7 +37,9 @@ impl Document {
             }
         };
 
-        let raw = serde_json::to_vec(&value).unwrap_or_default().into_boxed_slice();
+        let raw = serde_json::to_vec(&value)
+            .expect("Document::new: serde_json::to_vec failed on valid Value")
+            .into_boxed_slice();
         Document { id, data: value, raw }
     }
 
@@ -47,7 +49,9 @@ impl Document {
         if let Some(obj) = data.as_object_mut() {
             obj.insert("_id".to_string(), Value::String(id.clone()));
         }
-        let raw = serde_json::to_vec(&data).unwrap_or_default().into_boxed_slice();
+        let raw = serde_json::to_vec(&data)
+            .expect("Document::with_id: serde_json::to_vec failed on valid Value")
+            .into_boxed_slice();
         Document { id, data, raw }
     }
 
@@ -86,7 +90,9 @@ impl Document {
         if let Some(obj) = data.as_object_mut() {
             obj.insert("_id".to_string(), Value::String(self.id.clone()));
         }
-        self.raw = serde_json::to_vec(&data).unwrap_or_default().into_boxed_slice();
+        self.raw = serde_json::to_vec(&data)
+            .expect("Document::set_data: serde_json::to_vec failed on valid Value")
+            .into_boxed_slice();
         self.data = data;
     }
 

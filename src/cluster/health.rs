@@ -50,21 +50,37 @@ impl HealthChecker {
     /// Run the health check loop. This never returns.
     pub async fn run(self) {
         loop {
+            // Check all peers concurrently instead of serially
+            let mut handles = Vec::with_capacity(self.peers.len());
             for (node_id, peer) in &self.peers {
-                let reachable = peer.ping().await;
-                let mut status = self.status.write().await;
-                if let Some(s) = status.get_mut(node_id) {
-                    if reachable {
-                        s.healthy = true;
-                        s.last_seen = Some(Instant::now());
-                        s.consecutive_failures = 0;
-                    } else {
-                        s.consecutive_failures += 1;
-                        if s.consecutive_failures >= UNHEALTHY_THRESHOLD {
-                            if s.healthy {
-                                eprintln!("fluxdb: node {node_id} marked unhealthy");
+                let peer = Arc::clone(peer);
+                let node_id = node_id.clone();
+                handles.push(tokio::spawn(async move {
+                    let reachable = peer.ping().await;
+                    (node_id, reachable)
+                }));
+            }
+
+            // Collect results and update status
+            for handle in handles {
+                if let Ok((node_id, reachable)) = handle.await {
+                    let mut status = self.status.write().await;
+                    if let Some(s) = status.get_mut(&node_id) {
+                        if reachable {
+                            if !s.healthy {
+                                eprintln!("fluxdb: node {node_id} recovered, marking healthy");
                             }
-                            s.healthy = false;
+                            s.healthy = true;
+                            s.last_seen = Some(Instant::now());
+                            s.consecutive_failures = 0;
+                        } else {
+                            s.consecutive_failures += 1;
+                            if s.consecutive_failures >= UNHEALTHY_THRESHOLD {
+                                if s.healthy {
+                                    eprintln!("fluxdb: node {node_id} marked unhealthy after {} failures", s.consecutive_failures);
+                                }
+                                s.healthy = false;
+                            }
                         }
                     }
                 }

@@ -10,11 +10,11 @@ Benchmarked against established storage engines on equivalent workloads (10,000 
 
 | Operation | FluxDB | SQLite (WAL) | RocksDB | redb | MongoDB |
 |-----------|-------:|-------------:|--------:|-----:|--------:|
-| **Insert** | **2.4 µs** | 12.1 µs | 2.6 µs | 4,520 µs | 54.8 µs |
-| **Get** | **412 ns** | 1,241 ns | 422 ns | 689 ns | 58,407 ns |
-| **Scan 10K** | **25.7 µs** | 1,037 µs | 818 µs | 360 µs | 10,747 µs |
+| **Insert** | **2.89 µs** | 12.6 µs | 2.64 µs | 4,317 µs | 56.2 µs |
+| **Get** | **421 ns** | 1,252 ns | 440 ns | 673 ns | 62,235 ns |
+| **Scan 10K** | **26.0 µs** | 1,048 µs | 859 µs | 355 µs | 11,404 µs |
 
-FluxDB's zero-copy scan path is 14x faster than redb and 40x faster than SQLite. Point reads are 3x faster than SQLite, on par with RocksDB. Inserts are 5x faster than SQLite and 23x faster than MongoDB.
+FluxDB's zero-copy scan path is 14x faster than redb and 40x faster than SQLite. Point reads are 3x faster than SQLite, on par with RocksDB. Inserts are 4x faster than SQLite and 19x faster than MongoDB.
 
 Run the benchmarks yourself:
 
@@ -37,10 +37,15 @@ cargo bench --bench comparison
 - **Per-collection concurrency** — RwLocks per collection allow parallel reads with minimal contention
 - **TCP server** — async multi-client server with line-delimited JSON protocol
 - **Redis protocol** — drop-in Redis compatibility (GET, SET, HSET, HGET, and more)
-- **Horizontal scaling** — consistent-hash cluster mode with automatic sharding and scatter-gather queries
+- **Horizontal scaling** — consistent-hash cluster mode with automatic sharding, scatter-gather queries, and health-aware routing
+- **Authentication** — optional token-based auth for both JSON and Redis protocols
+- **Connection limits** — configurable max connections with semaphore-based enforcement
+- **Graceful shutdown** — `Ctrl-C` triggers coordinated shutdown with WAL flush before exit
+- **Input validation** — collection name validation, document size limits, request size limits, query result caps
+- **Lock poison recovery** — all mutex/RwLock acquisitions return errors instead of panicking
 - **Pluggable storage** — `StorageBackend` trait for custom persistence (WAL, in-memory, or your own)
 - **Embeddable** — use as a library with no runtime dependencies; works on `wasm32` targets
-- **TOML configuration** — file-based config with CLI flag overrides
+- **TOML configuration** — file-based config with CLI flag overrides and startup validation
 - **Backward compatible** — reads legacy JSON-format WAL files automatically
 
 ## Getting started
@@ -128,6 +133,20 @@ data_dir = "./fluxdb_data"
 # Address and port for the JSON protocol server.
 listen = "127.0.0.1:7654"
 
+[auth]
+# Enable token-based authentication.
+enabled = false
+# Shared secret token (required when auth is enabled).
+token = ""
+
+[limits]
+# Maximum concurrent client connections (0 = unlimited).
+max_connections = 1024
+# Maximum document size in bytes (default 16 MB).
+max_document_bytes = 16777216
+# Maximum number of documents returned by a single query (default 100K).
+max_result_count = 100000
+
 [wal]
 # Number of WAL entries to buffer before flushing to disk.
 batch_size = 64
@@ -165,6 +184,7 @@ client_addr = "127.0.0.1:7654"
 | `--wal-batch-size <n>` | `wal.batch_size` | WAL entries before flush |
 | `--wal-batch-bytes <n>` | `wal.batch_bytes` | WAL bytes before flush |
 | `--redis [addr]` | `redis.enabled` + `redis.listen` | Enable Redis protocol (optional address) |
+| `--auth-token <token>` | `auth.token` | Enable auth with the given token |
 | `--init-config <path>` | — | Write default config to file and exit |
 
 ### Feature flags
@@ -244,10 +264,12 @@ Indexes accelerate equality (`$eq`), range (`$gt`, `$gte`, `$lt`, `$lte`), and m
 ### Other commands
 
 ```json
+{"cmd": "auth", "token": "my-secret-token"}
 {"cmd": "count", "collection": "users", "filter": {"age": {"$gte": 25}}}
 {"cmd": "list_collections"}
 {"cmd": "drop_collection", "name": "users"}
 {"cmd": "compact"}
+{"cmd": "flush"}
 {"cmd": "stats"}
 ```
 
@@ -375,7 +397,7 @@ Different operations are handled differently across the cluster:
 | `list_collections` | **Scatter-gather** | Union of collections from all nodes |
 | `create_collection`, `drop_collection` | **Broadcast** | Executed on every node |
 | `create_index`, `drop_index` | **Broadcast** | Executed on every node |
-| `compact`, `stats` | **Local only** | Runs on the node that received the request |
+| `compact`, `stats`, `flush` | **Local only** | Runs on the node that received the request |
 
 For scatter-gather queries with `limit` and `skip`, each node returns up to `limit + skip` results. The router then merges all results, applies `skip`, and truncates to `limit` — ensuring correct pagination without missing documents.
 
@@ -432,12 +454,15 @@ src/
 - **Atomic compaction** — WAL compaction writes to a temp file and atomically renames, ensuring crash safety
 - **CRC32 recovery** — on startup, corrupted WAL entries are skipped while preserving all valid entries before the corruption point
 - **spawn_blocking** — database operations run on tokio's blocking pool, keeping the async runtime responsive
+- **Graceful shutdown** — `Ctrl-C` triggers coordinated shutdown via broadcast channel; WAL is flushed before exit
+- **Lock poison recovery** — all lock acquisitions return `Result` instead of panicking, preventing cascading failures
+- **Health-aware routing** — cluster router checks node health before forwarding; scatter operations skip unhealthy nodes
 
 ## Testing
 
 ```bash
-cargo test                    # 76 tests (core + server)
-cargo test --features cluster # 86 tests (adds cluster integration)
+cargo test                    # 79 tests (core + server)
+cargo test --features cluster # 89 tests (adds cluster integration)
 ```
 
-Covers documents, queries, projections, sort, field-level `$not`, collections, indexes (including cross-type numeric and `$or`/`$and` index usage), WAL persistence, crash recovery, CRC corruption recovery, atomic compaction, deterministic pagination, concurrent access, hash ring distribution, and cluster routing.
+Covers documents, queries, projections, sort, field-level `$not`, collections, indexes (including cross-type numeric and `$or`/`$and` index usage), WAL persistence, crash recovery, CRC corruption recovery, atomic compaction, deterministic pagination, concurrent access, input validation, document size limits, config validation, hash ring distribution, and cluster routing.

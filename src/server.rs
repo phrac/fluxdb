@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::database::Database;
@@ -11,6 +12,9 @@ use crate::database::Database;
 pub struct Server {
     db: Arc<Database>,
     addr: String,
+    max_connections: usize,
+    auth_token: Option<String>,
+    max_document_bytes: usize,
     #[cfg(feature = "cluster")]
     router: Option<Arc<crate::cluster::router::ClusterRouter>>,
 }
@@ -31,9 +35,18 @@ impl Server {
             None
         };
 
+        let auth_token = if config.auth.enabled {
+            Some(config.auth.token.clone())
+        } else {
+            None
+        };
+
         Ok(Server {
             db,
             addr: config.listen.clone(),
+            max_connections: config.limits.max_connections,
+            auth_token,
+            max_document_bytes: config.limits.max_document_bytes,
             #[cfg(feature = "cluster")]
             router,
         })
@@ -42,6 +55,16 @@ impl Server {
     /// Get a shared reference to the underlying database.
     pub fn db(&self) -> Arc<Database> {
         Arc::clone(&self.db)
+    }
+
+    /// Get the auth token (for Redis server to share).
+    pub fn auth_token(&self) -> Option<&str> {
+        self.auth_token.as_deref()
+    }
+
+    /// Get max connections setting.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
     }
 
     /// Start the health checker background task (cluster mode only).
@@ -53,7 +76,7 @@ impl Server {
         }
     }
 
-    pub async fn run(&self) -> crate::error::Result<()> {
+    pub async fn run(&self, mut shutdown: tokio::sync::broadcast::Receiver<()>) -> crate::error::Result<()> {
         let listener = TcpListener::bind(&self.addr).await?;
         eprintln!("FluxDB listening on {}", self.addr);
 
@@ -62,22 +85,58 @@ impl Server {
             self.start_health_checker();
         }
 
+        // Connection limiter (0 = unlimited, use a very high permit count)
+        let max_conn = if self.max_connections > 0 {
+            self.max_connections
+        } else {
+            usize::MAX >> 1
+        };
+        let semaphore = Arc::new(Semaphore::new(max_conn));
+
         loop {
-            let (stream, peer) = listener.accept().await?;
-            eprintln!("Client connected: {peer}");
-            let db = Arc::clone(&self.db);
-            #[cfg(feature = "cluster")]
-            let router = self.router.clone();
-            tokio::spawn(async move {
-                #[cfg(feature = "cluster")]
-                let result = handle_client(stream, db, router).await;
-                #[cfg(not(feature = "cluster"))]
-                let result = handle_client(stream, db).await;
-                if let Err(e) = result {
-                    eprintln!("Client error: {e}");
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, peer) = result?;
+
+                    // Acquire connection permit
+                    let permit = match semaphore.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            eprintln!("Connection limit reached, rejecting {peer}");
+                            // Write error and close
+                            let stream = stream;
+                            let msg = serde_json::to_string(&json!({"ok": false, "error": "too many connections"})).unwrap();
+                            let _ = stream.try_write(format!("{msg}\n").as_bytes());
+                            continue;
+                        }
+                    };
+
+                    eprintln!("Client connected: {peer}");
+                    let db = Arc::clone(&self.db);
+                    let auth_token = self.auth_token.clone();
+                    let max_doc_bytes = self.max_document_bytes;
+                    #[cfg(feature = "cluster")]
+                    let router = self.router.clone();
+
+                    tokio::spawn(async move {
+                        #[cfg(feature = "cluster")]
+                        let result = handle_client(stream, db, router, auth_token.as_deref(), max_doc_bytes).await;
+                        #[cfg(not(feature = "cluster"))]
+                        let result = handle_client(stream, db, auth_token.as_deref(), max_doc_bytes).await;
+                        if let Err(e) = result {
+                            eprintln!("Client error: {e}");
+                        }
+                        drop(permit); // Release connection slot
+                    });
                 }
-            });
+                _ = shutdown.recv() => {
+                    eprintln!("Shutting down server...");
+                    break;
+                }
+            }
         }
+
+        Ok(())
     }
 }
 
@@ -85,29 +144,72 @@ async fn handle_client(
     stream: TcpStream,
     db: Arc<Database>,
     #[cfg(feature = "cluster")] router: Option<Arc<crate::cluster::router::ClusterRouter>>,
+    auth_token: Option<&str>,
+    max_document_bytes: usize,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
+    let mut authenticated = auth_token.is_none(); // If no auth required, start authenticated
 
     while let Some(line) = lines.next_line().await? {
         if line.is_empty() {
             continue;
         }
 
+        // Reject oversized requests early
+        if line.len() > max_document_bytes + 1024 {
+            let response = json!({"ok": false, "error": "request too large"});
+            let mut response_str = serde_json::to_string(&response)?;
+            response_str.push('\n');
+            writer.write_all(response_str.as_bytes()).await?;
+            writer.flush().await?;
+            continue;
+        }
+
         let response = match serde_json::from_str::<Value>(&line) {
             Ok(request) => {
-                // In cluster mode: route unless the request is already routed to us
-                #[cfg(feature = "cluster")]
-                {
-                    let is_routed = request
-                        .get("_routed")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-
-                    if !is_routed {
-                        if let Some(ref router) = router {
-                            router.route(&request).await
+                // Handle auth command
+                if !authenticated {
+                    if let Some(cmd) = request["cmd"].as_str() {
+                        if cmd == "auth" {
+                            if let Some(token) = request["token"].as_str() {
+                                if Some(token) == auth_token {
+                                    authenticated = true;
+                                    json!({"ok": true})
+                                } else {
+                                    json!({"ok": false, "error": "invalid auth token"})
+                                }
+                            } else {
+                                json!({"ok": false, "error": "missing 'token' field"})
+                            }
                         } else {
+                            json!({"ok": false, "error": "authentication required: send {\"cmd\":\"auth\",\"token\":\"...\"}"})
+                        }
+                    } else {
+                        json!({"ok": false, "error": "authentication required"})
+                    }
+                } else {
+                    // In cluster mode: route unless the request is already routed to us
+                    #[cfg(feature = "cluster")]
+                    {
+                        let is_routed = request
+                            .get("_routed")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+
+                        if !is_routed {
+                            if let Some(ref router) = router {
+                                router.route(&request).await
+                            } else {
+                                let db = Arc::clone(&db);
+                                tokio::task::spawn_blocking(move || process_command(&db, &request))
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        json!({"ok": false, "error": format!("internal error: {e}")})
+                                    })
+                            }
+                        } else {
+                            // Already routed — execute locally
                             let db = Arc::clone(&db);
                             tokio::task::spawn_blocking(move || process_command(&db, &request))
                                 .await
@@ -115,8 +217,10 @@ async fn handle_client(
                                     json!({"ok": false, "error": format!("internal error: {e}")})
                                 })
                         }
-                    } else {
-                        // Already routed — execute locally
+                    }
+
+                    #[cfg(not(feature = "cluster"))]
+                    {
                         let db = Arc::clone(&db);
                         tokio::task::spawn_blocking(move || process_command(&db, &request))
                             .await
@@ -124,16 +228,6 @@ async fn handle_client(
                                 json!({"ok": false, "error": format!("internal error: {e}")})
                             })
                     }
-                }
-
-                #[cfg(not(feature = "cluster"))]
-                {
-                    let db = Arc::clone(&db);
-                    tokio::task::spawn_blocking(move || process_command(&db, &request))
-                        .await
-                        .unwrap_or_else(|e| {
-                            json!({"ok": false, "error": format!("internal error: {e}")})
-                        })
                 }
             }
             Err(e) => json!({"ok": false, "error": format!("invalid JSON: {e}")}),
@@ -322,6 +416,11 @@ pub fn process_command(db: &Database, request: &Value) -> Value {
         }
 
         "compact" => match db.compact() {
+            Ok(()) => json!({"ok": true}),
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        },
+
+        "flush" => match db.flush() {
             Ok(()) => json!({"ok": true}),
             Err(e) => json!({"ok": false, "error": e.to_string()}),
         },

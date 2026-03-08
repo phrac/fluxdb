@@ -35,6 +35,10 @@ pub struct Cli {
     /// Generate a default config file and exit
     #[arg(long)]
     pub init_config: Option<PathBuf>,
+
+    /// Authentication token (required for client connections when set)
+    #[arg(long)]
+    pub auth_token: Option<String>,
 }
 
 /// Configuration loaded from TOML file.
@@ -54,6 +58,12 @@ pub struct Config {
 
     #[serde(default)]
     pub cluster: ClusterConfig,
+
+    #[serde(default)]
+    pub limits: LimitsConfig,
+
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +76,75 @@ pub struct RedisConfig {
     #[serde(default = "default_redis_listen")]
     pub listen: String,
 }
+
+/// Authentication configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Require token-based authentication for all connections.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The shared secret token clients must provide.
+    #[serde(default)]
+    pub token: String,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        AuthConfig {
+            enabled: false,
+            token: String::new(),
+        }
+    }
+}
+
+/// Resource limits for protecting against DoS and OOM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    /// Maximum concurrent client connections (0 = unlimited).
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
+    /// Maximum document size in bytes.
+    #[serde(default = "default_max_document_bytes")]
+    pub max_document_bytes: usize,
+
+    /// Maximum number of documents returned by a single find() query.
+    #[serde(default = "default_max_result_count")]
+    pub max_result_count: usize,
+
+    /// Maximum collection name length.
+    #[serde(default = "default_max_collection_name_len")]
+    pub max_collection_name_len: usize,
+
+    /// Maximum RESP bulk string size (Redis protocol).
+    #[serde(default = "default_max_resp_bulk_bytes")]
+    pub max_resp_bulk_bytes: usize,
+
+    /// Maximum RESP array elements (Redis protocol).
+    #[serde(default = "default_max_resp_array_len")]
+    pub max_resp_array_len: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            max_connections: default_max_connections(),
+            max_document_bytes: default_max_document_bytes(),
+            max_result_count: default_max_result_count(),
+            max_collection_name_len: default_max_collection_name_len(),
+            max_resp_bulk_bytes: default_max_resp_bulk_bytes(),
+            max_resp_array_len: default_max_resp_array_len(),
+        }
+    }
+}
+
+fn default_max_connections() -> usize { 1024 }
+fn default_max_document_bytes() -> usize { 16 * 1024 * 1024 } // 16 MB
+fn default_max_result_count() -> usize { 100_000 }
+fn default_max_collection_name_len() -> usize { 128 }
+fn default_max_resp_bulk_bytes() -> usize { 64 * 1024 * 1024 } // 64 MB
+fn default_max_resp_array_len() -> usize { 100_000 }
 
 /// Cluster configuration for multi-node deployments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +211,8 @@ impl Default for Config {
             wal: WalConfig::default(),
             redis: RedisConfig::default(),
             cluster: ClusterConfig::default(),
+            limits: LimitsConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -213,8 +294,90 @@ impl Config {
                 config.redis.listen = addr.clone();
             }
         }
+        if let Some(ref token) = cli.auth_token {
+            config.auth.enabled = true;
+            config.auth.token = token.clone();
+        }
 
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Validate configuration values.
+    fn validate(&self) -> Result<(), String> {
+        // Validate listen address format
+        if !self.listen.contains(':') {
+            return Err(format!("invalid listen address '{}': must be host:port", self.listen));
+        }
+
+        // Validate WAL settings
+        if self.wal.batch_size == 0 {
+            return Err("wal.batch_size must be > 0".into());
+        }
+        if self.wal.batch_size > 100_000 {
+            return Err("wal.batch_size must be <= 100000".into());
+        }
+        if self.wal.batch_bytes == 0 {
+            return Err("wal.batch_bytes must be > 0".into());
+        }
+        if self.wal.batch_bytes > 256 * 1024 * 1024 {
+            return Err("wal.batch_bytes must be <= 256MB".into());
+        }
+
+        // Validate limits
+        if self.limits.max_document_bytes == 0 {
+            return Err("limits.max_document_bytes must be > 0".into());
+        }
+        if self.limits.max_result_count == 0 {
+            return Err("limits.max_result_count must be > 0".into());
+        }
+
+        // Validate Redis config
+        if self.redis.enabled && !self.redis.listen.contains(':') {
+            return Err(format!(
+                "invalid redis listen address '{}': must be host:port",
+                self.redis.listen
+            ));
+        }
+
+        // Validate cluster config
+        if self.cluster.enabled {
+            if self.cluster.node_id.is_empty() {
+                return Err("cluster.node_id must be set when cluster is enabled".into());
+            }
+            if self.cluster.nodes.is_empty() {
+                return Err("cluster.nodes must not be empty when cluster is enabled".into());
+            }
+            if !self.cluster.peer_listen.contains(':') {
+                return Err(format!(
+                    "invalid cluster peer_listen '{}': must be host:port",
+                    self.cluster.peer_listen
+                ));
+            }
+            // Validate this node exists in the node list
+            let found = self.cluster.nodes.iter().any(|n| n.id == self.cluster.node_id);
+            if !found {
+                return Err(format!(
+                    "cluster.node_id '{}' not found in cluster.nodes",
+                    self.cluster.node_id
+                ));
+            }
+        }
+
+        // Auth validation
+        if self.auth.enabled && self.auth.token.is_empty() {
+            return Err("auth.token must be set when auth is enabled".into());
+        }
+
+        // Warn about binding to all interfaces
+        if self.listen.starts_with("0.0.0.0") && !self.auth.enabled {
+            eprintln!(
+                "WARNING: Listening on all interfaces (0.0.0.0) without authentication. \
+                 Consider enabling auth for production use."
+            );
+        }
+
+        Ok(())
     }
 
     fn from_file(path: &Path) -> Result<Self, String> {
@@ -260,6 +423,32 @@ impl Config {
              listen = {:?}\n\n",
             self.redis.listen
         ));
+        out.push_str("[limits]\n");
+        out.push_str(&format!(
+            "# Maximum concurrent client connections (0 = unlimited).\n\
+             max_connections = {}\n\n",
+            self.limits.max_connections
+        ));
+        out.push_str(&format!(
+            "# Maximum document size in bytes.\n\
+             max_document_bytes = {}\n\n",
+            self.limits.max_document_bytes
+        ));
+        out.push_str(&format!(
+            "# Maximum documents returned by a single find() query.\n\
+             max_result_count = {}\n\n",
+            self.limits.max_result_count
+        ));
+        out.push_str("[auth]\n");
+        out.push_str(&format!(
+            "# Require token authentication for connections.\n\
+             enabled = {}\n\n",
+            self.auth.enabled
+        ));
+        out.push_str(
+            "# Shared secret token.\n\
+             # token = \"your-secret-token-here\"\n\n",
+        );
         out.push_str("[cluster]\n");
         out.push_str(&format!(
             "# Enable distributed cluster mode.\n\

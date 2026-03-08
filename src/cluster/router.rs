@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tokio::sync::RwLock;
 
+use crate::cluster::health::NodeStatus;
 use crate::cluster::peer::PeerClient;
 use crate::cluster::ring::HashRing;
 use crate::config::ClusterConfig;
@@ -13,11 +15,15 @@ use crate::database::Database;
 /// Point operations (get, insert, update, delete) are routed by hashing
 /// `(collection, doc_id)` to find the owner node. Scatter-gather operations
 /// (find, count, list_collections) fan out to all nodes in parallel.
+///
+/// Consults the health status before forwarding — refuses to route to
+/// unhealthy nodes, returning an error to the client.
 pub struct ClusterRouter {
     local_node_id: String,
     local_db: Arc<Database>,
     ring: Arc<HashRing>,
     peers: HashMap<String, Arc<PeerClient>>,
+    health_status: Arc<RwLock<HashMap<String, NodeStatus>>>,
 }
 
 impl ClusterRouter {
@@ -35,12 +41,42 @@ impl ClusterRouter {
             }
         }
 
+        // Initialize health status (all healthy until checker says otherwise)
+        let mut status = HashMap::new();
+        for node in &config.nodes {
+            if node.id != config.node_id {
+                status.insert(
+                    node.id.clone(),
+                    NodeStatus {
+                        healthy: true,
+                        last_seen: None,
+                        consecutive_failures: 0,
+                    },
+                );
+            }
+        }
+
         ClusterRouter {
             local_node_id: config.node_id.clone(),
             local_db,
             ring,
             peers,
+            health_status: Arc::new(RwLock::new(status)),
         }
+    }
+
+    /// Set the health status handle (called after health checker is created).
+    pub fn set_health_status(&mut self, status: Arc<RwLock<HashMap<String, NodeStatus>>>) {
+        self.health_status = status;
+    }
+
+    /// Check if a node is currently healthy.
+    async fn is_node_healthy(&self, node_id: &str) -> bool {
+        if node_id == self.local_node_id {
+            return true; // local node is always "healthy"
+        }
+        let status = self.health_status.read().await;
+        status.get(node_id).map_or(false, |s| s.healthy)
     }
 
     /// Route a command. Returns the response JSON.
@@ -71,7 +107,7 @@ impl ClusterRouter {
             }
 
             // Local-only operations
-            "compact" | "stats" | "list_indexes" | "cluster_status" => {
+            "compact" | "stats" | "list_indexes" | "cluster_status" | "flush" => {
                 self.execute_local(request)
             }
 
@@ -92,7 +128,12 @@ impl ClusterRouter {
 
         match self.ring.owner(collection, id) {
             Some(node) if node.id == self.local_node_id => self.execute_local(request),
-            Some(node) => self.forward_to(&node.id, request).await,
+            Some(node) => {
+                if !self.is_node_healthy(&node.id).await {
+                    return json!({"ok": false, "error": format!("node {} is unhealthy", node.id)});
+                }
+                self.forward_to(&node.id, request).await
+            }
             None => json!({"ok": false, "error": "no nodes in cluster"}),
         }
     }
@@ -123,7 +164,12 @@ impl ClusterRouter {
 
         match self.ring.owner(collection, &id) {
             Some(node) if node.id == self.local_node_id => self.execute_local(&request),
-            Some(node) => self.forward_to(&node.id, &request).await,
+            Some(node) => {
+                if !self.is_node_healthy(&node.id).await {
+                    return json!({"ok": false, "error": format!("node {} is unhealthy", node.id)});
+                }
+                self.forward_to(&node.id, &request).await
+            }
             None => json!({"ok": false, "error": "no nodes in cluster"}),
         }
     }
@@ -213,15 +259,21 @@ impl ClusterRouter {
         json!({"ok": true})
     }
 
-    /// Fan out a request to all nodes (local + all peers) in parallel.
+    /// Fan out a request to all nodes (local + healthy peers) in parallel.
     async fn scatter(&self, request: &Value) -> Vec<Value> {
         let mut handles = Vec::with_capacity(self.peers.len() + 1);
 
         // Local execution
         let local_result = self.execute_local(request);
 
-        // Remote executions in parallel
+        // Remote executions in parallel (only healthy nodes)
+        let health = self.health_status.read().await;
         for (node_id, peer) in &self.peers {
+            let is_healthy = health.get(node_id).map_or(false, |s| s.healthy);
+            if !is_healthy {
+                eprintln!("fluxdb: skipping unhealthy node {node_id} in scatter");
+                continue;
+            }
             let peer = Arc::clone(peer);
             let req = request.clone();
             let node_id = node_id.clone();
@@ -232,6 +284,7 @@ impl ClusterRouter {
                 }
             }));
         }
+        drop(health); // Release read lock before awaiting
 
         let mut results = vec![local_result];
         for handle in handles {
@@ -273,5 +326,10 @@ impl ClusterRouter {
     /// Get peer clients (for health checks).
     pub fn peers(&self) -> &HashMap<String, Arc<PeerClient>> {
         &self.peers
+    }
+
+    /// Get health status handle.
+    pub fn health_status(&self) -> Arc<RwLock<HashMap<String, NodeStatus>>> {
+        Arc::clone(&self.health_status)
     }
 }

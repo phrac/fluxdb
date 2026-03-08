@@ -19,7 +19,7 @@ crc32fast = "1"
 bincode = "1"
 
 # Optional: only needed with the "server" feature
-tokio = { version = "1", features = ["full"], optional = true }
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "signal", "rt-multi-thread", "macros"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
 

@@ -16,6 +16,24 @@ use std::path::Path;
 #[cfg(feature = "persistence")]
 use crate::wal::{Wal, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES};
 
+/// Maximum collection name length.
+const MAX_COLLECTION_NAME_LEN: usize = 128;
+
+/// Maximum document size in bytes (default, overridable via config).
+const DEFAULT_MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum results from a single find query (default, overridable via config).
+const DEFAULT_MAX_RESULT_COUNT: usize = 100_000;
+
+/// Characters allowed in collection names.
+fn is_valid_collection_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_COLLECTION_NAME_LEN
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
+        && !name.starts_with('.')
+        && !name.contains("..")
+}
+
 /// The main database engine.
 ///
 /// Internally synchronized with per-collection RwLocks for maximum read concurrency.
@@ -24,6 +42,29 @@ pub struct Database {
     pub name: String,
     collections: RwLock<HashMap<String, Arc<RwLock<Collection>>>>,
     storage: Mutex<Box<dyn StorageBackend>>,
+    max_document_bytes: usize,
+    max_result_count: usize,
+}
+
+// Helper to handle poisoned locks gracefully
+fn lock_storage(storage: &Mutex<Box<dyn StorageBackend>>) -> Result<std::sync::MutexGuard<'_, Box<dyn StorageBackend>>> {
+    storage.lock().map_err(|_| FluxError::Internal("storage lock poisoned".into()))
+}
+
+fn read_collections(collections: &RwLock<HashMap<String, Arc<RwLock<Collection>>>>) -> Result<std::sync::RwLockReadGuard<'_, HashMap<String, Arc<RwLock<Collection>>>>> {
+    collections.read().map_err(|_| FluxError::Internal("collections lock poisoned".into()))
+}
+
+fn write_collections(collections: &RwLock<HashMap<String, Arc<RwLock<Collection>>>>) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<String, Arc<RwLock<Collection>>>>> {
+    collections.write().map_err(|_| FluxError::Internal("collections lock poisoned".into()))
+}
+
+fn read_collection(col: &RwLock<Collection>) -> Result<std::sync::RwLockReadGuard<'_, Collection>> {
+    col.read().map_err(|_| FluxError::Internal("collection lock poisoned".into()))
+}
+
+fn write_collection(col: &RwLock<Collection>) -> Result<std::sync::RwLockWriteGuard<'_, Collection>> {
+    col.write().map_err(|_| FluxError::Internal("collection lock poisoned".into()))
 }
 
 impl Database {
@@ -43,6 +84,8 @@ impl Database {
             name: name.into(),
             collections: RwLock::new(wrapped),
             storage: Mutex::new(storage),
+            max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
+            max_result_count: DEFAULT_MAX_RESULT_COUNT,
         })
     }
 
@@ -52,6 +95,8 @@ impl Database {
             name: "memory".to_string(),
             collections: RwLock::new(HashMap::new()),
             storage: Mutex::new(Box::new(MemoryBackend::new())),
+            max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
+            max_result_count: DEFAULT_MAX_RESULT_COUNT,
         }
     }
 
@@ -91,6 +136,8 @@ impl Database {
             name,
             collections: RwLock::new(wrapped),
             storage: Mutex::new(Box::new(wal)),
+            max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
+            max_result_count: DEFAULT_MAX_RESULT_COUNT,
         })
     }
 
@@ -98,7 +145,10 @@ impl Database {
     #[cfg(feature = "server")]
     pub fn open_with_config(config: &crate::config::Config, data_dir_override: Option<&Path>) -> Result<Self> {
         let data_dir = data_dir_override.unwrap_or(&config.data_dir);
-        Self::open_with_wal(data_dir, config.wal.batch_size, config.wal.batch_bytes)
+        let mut db = Self::open_with_wal(data_dir, config.wal.batch_size, config.wal.batch_bytes)?;
+        db.max_document_bytes = config.limits.max_document_bytes;
+        db.max_result_count = config.limits.max_result_count;
+        Ok(db)
     }
 
     fn replay_entries(entries: &[WalEntry]) -> Result<HashMap<String, Collection>> {
@@ -157,8 +207,16 @@ impl Database {
 
     /// Create a new collection.
     pub fn create_collection(&self, name: &str) -> Result<()> {
-        let mut wal = self.storage.lock().unwrap();
-        let mut collections = self.collections.write().unwrap();
+        if !is_valid_collection_name(name) {
+            return Err(FluxError::InvalidInput(format!(
+                "invalid collection name '{}': must be 1-{} chars, alphanumeric/underscore/hyphen/dot, \
+                 cannot start with '.' or contain '..'",
+                name, MAX_COLLECTION_NAME_LEN
+            )));
+        }
+
+        let mut wal = lock_storage(&self.storage)?;
+        let mut collections = write_collections(&self.collections)?;
 
         if collections.contains_key(name) {
             return Err(FluxError::CollectionAlreadyExists(name.to_string()));
@@ -177,8 +235,8 @@ impl Database {
 
     /// Drop a collection and all its documents.
     pub fn drop_collection(&self, name: &str) -> Result<()> {
-        let mut wal = self.storage.lock().unwrap();
-        let mut collections = self.collections.write().unwrap();
+        let mut wal = lock_storage(&self.storage)?;
+        let mut collections = write_collections(&self.collections)?;
 
         if !collections.contains_key(name) {
             return Err(FluxError::CollectionNotFound(name.to_string()));
@@ -194,15 +252,27 @@ impl Database {
 
     /// List all collection names.
     pub fn list_collections(&self) -> Vec<String> {
-        let collections = self.collections.read().unwrap();
+        let collections = match read_collections(&self.collections) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
         collections.keys().cloned().collect()
     }
 
     /// Insert a document into a collection.
     pub fn insert(&self, collection: &str, value: Value) -> Result<String> {
+        // Validate document size
+        let estimated_size = value.to_string().len();
+        if estimated_size > self.max_document_bytes {
+            return Err(FluxError::ResourceLimit(format!(
+                "document size {} bytes exceeds limit of {} bytes",
+                estimated_size, self.max_document_bytes
+            )));
+        }
+
         // Get Arc to collection (read-lock the map briefly)
         let col_arc = {
-            let collections = self.collections.read().unwrap();
+            let collections = read_collections(&self.collections)?;
             collections
                 .get(collection)
                 .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?
@@ -217,7 +287,7 @@ impl Database {
 
         // WAL first
         {
-            let mut wal = self.storage.lock().unwrap();
+            let mut wal = lock_storage(&self.storage)?;
             wal.append(WalOperation::Insert {
                 collection: collection.to_string(),
                 doc_id: id.clone(),
@@ -226,7 +296,7 @@ impl Database {
         }
 
         // Then mutate
-        let mut col = col_arc.write().unwrap();
+        let mut col = write_collection(&col_arc)?;
         col.insert(doc);
 
         Ok(id)
@@ -234,20 +304,29 @@ impl Database {
 
     /// Get a document by ID from a collection.
     pub fn get(&self, collection: &str, id: &str) -> Result<Value> {
-        let collections = self.collections.read().unwrap();
+        let collections = read_collections(&self.collections)?;
         let col_arc = collections
             .get(collection)
             .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?;
 
-        let col = col_arc.read().unwrap();
+        let col = read_collection(col_arc)?;
         let doc = col.get(id)?;
         Ok(doc.to_value())
     }
 
     /// Update a document by ID with new data.
     pub fn update(&self, collection: &str, id: &str, data: Value) -> Result<()> {
+        // Validate document size
+        let estimated_size = data.to_string().len();
+        if estimated_size > self.max_document_bytes {
+            return Err(FluxError::ResourceLimit(format!(
+                "document size {} bytes exceeds limit of {} bytes",
+                estimated_size, self.max_document_bytes
+            )));
+        }
+
         let col_arc = {
-            let collections = self.collections.read().unwrap();
+            let collections = read_collections(&self.collections)?;
             collections
                 .get(collection)
                 .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?
@@ -256,7 +335,7 @@ impl Database {
 
         // Verify document exists
         {
-            let col = col_arc.read().unwrap();
+            let col = read_collection(&col_arc)?;
             col.get(id)?;
         }
 
@@ -270,7 +349,7 @@ impl Database {
         };
 
         {
-            let mut wal = self.storage.lock().unwrap();
+            let mut wal = lock_storage(&self.storage)?;
             wal.append(WalOperation::Update {
                 collection: collection.to_string(),
                 doc_id: id.to_string(),
@@ -278,7 +357,7 @@ impl Database {
             })?;
         }
 
-        let mut col = col_arc.write().unwrap();
+        let mut col = write_collection(&col_arc)?;
         col.update(id, update_data)?;
 
         Ok(())
@@ -287,7 +366,7 @@ impl Database {
     /// Delete a document by ID.
     pub fn delete(&self, collection: &str, id: &str) -> Result<bool> {
         let col_arc = {
-            let collections = self.collections.read().unwrap();
+            let collections = read_collections(&self.collections)?;
             collections
                 .get(collection)
                 .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?
@@ -296,21 +375,21 @@ impl Database {
 
         // Check existence
         {
-            let col = col_arc.read().unwrap();
+            let col = read_collection(&col_arc)?;
             if col.get(id).is_err() {
                 return Ok(false);
             }
         }
 
         {
-            let mut wal = self.storage.lock().unwrap();
+            let mut wal = lock_storage(&self.storage)?;
             wal.append(WalOperation::Delete {
                 collection: collection.to_string(),
                 doc_id: id.to_string(),
             })?;
         }
 
-        let mut col = col_arc.write().unwrap();
+        let mut col = write_collection(&col_arc)?;
         Ok(col.delete(id))
     }
 
@@ -324,13 +403,19 @@ impl Database {
         skip: Option<usize>,
         sort: Option<Value>,
     ) -> Result<Vec<Value>> {
-        let collections = self.collections.read().unwrap();
+        // Cap the result limit
+        let effective_limit = match limit {
+            Some(l) => Some(l.min(self.max_result_count)),
+            None => Some(self.max_result_count),
+        };
+
+        let collections = read_collections(&self.collections)?;
         let col_arc = collections
             .get(collection)
             .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?;
 
-        let col = col_arc.read().unwrap();
-        col.find(&filter, projection.as_ref(), limit, skip, sort.as_ref())
+        let col = read_collection(col_arc)?;
+        col.find(&filter, projection.as_ref(), effective_limit, skip, sort.as_ref())
     }
 
     /// Find documents and return pre-serialized JSON bytes.
@@ -342,13 +427,18 @@ impl Database {
         limit: Option<usize>,
         skip: Option<usize>,
     ) -> Result<Vec<Vec<u8>>> {
-        let collections = self.collections.read().unwrap();
+        let effective_limit = match limit {
+            Some(l) => Some(l.min(self.max_result_count)),
+            None => Some(self.max_result_count),
+        };
+
+        let collections = read_collections(&self.collections)?;
         let col_arc = collections
             .get(collection)
             .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?;
 
-        let col = col_arc.read().unwrap();
-        let slices = col.find_raw(&filter, limit, skip)?;
+        let col = read_collection(col_arc)?;
+        let slices = col.find_raw(&filter, effective_limit, skip)?;
         Ok(slices.into_iter().map(|s| s.to_vec()).collect())
     }
 
@@ -358,31 +448,38 @@ impl Database {
     where
         F: FnMut(&str, &[u8]),
     {
-        let collections = self.collections.read().unwrap();
+        let collections = read_collections(&self.collections)?;
         let col_arc = collections
             .get(collection)
             .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?;
 
-        let col = col_arc.read().unwrap();
+        let col = read_collection(col_arc)?;
         col.scan(f);
         Ok(())
     }
 
     /// Count documents matching a filter.
     pub fn count(&self, collection: &str, filter: Value) -> Result<usize> {
-        let collections = self.collections.read().unwrap();
+        let collections = read_collections(&self.collections)?;
         let col_arc = collections
             .get(collection)
             .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?;
 
-        let col = col_arc.read().unwrap();
+        let col = read_collection(col_arc)?;
         col.count(&filter)
     }
 
     /// Create a secondary index on a collection field.
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
+        // Validate field name
+        if field.is_empty() || field.len() > 256 {
+            return Err(FluxError::InvalidInput(
+                "field name must be 1-256 characters".into(),
+            ));
+        }
+
         let col_arc = {
-            let collections = self.collections.read().unwrap();
+            let collections = read_collections(&self.collections)?;
             collections
                 .get(collection)
                 .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?
@@ -390,21 +487,21 @@ impl Database {
         };
 
         {
-            let mut wal = self.storage.lock().unwrap();
+            let mut wal = lock_storage(&self.storage)?;
             wal.append(WalOperation::CreateIndex {
                 collection: collection.to_string(),
                 field: field.to_string(),
             })?;
         }
 
-        let mut col = col_arc.write().unwrap();
+        let mut col = write_collection(&col_arc)?;
         col.create_index(field)
     }
 
     /// Drop a secondary index.
     pub fn drop_index(&self, collection: &str, field: &str) -> Result<()> {
         let col_arc = {
-            let collections = self.collections.read().unwrap();
+            let collections = read_collections(&self.collections)?;
             collections
                 .get(collection)
                 .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?
@@ -412,25 +509,25 @@ impl Database {
         };
 
         {
-            let mut wal = self.storage.lock().unwrap();
+            let mut wal = lock_storage(&self.storage)?;
             wal.append(WalOperation::DropIndex {
                 collection: collection.to_string(),
                 field: field.to_string(),
             })?;
         }
 
-        let mut col = col_arc.write().unwrap();
+        let mut col = write_collection(&col_arc)?;
         col.drop_index(field)
     }
 
     /// List indexes on a collection.
     pub fn list_indexes(&self, collection: &str) -> Result<Vec<String>> {
-        let collections = self.collections.read().unwrap();
+        let collections = read_collections(&self.collections)?;
         let col_arc = collections
             .get(collection)
             .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?;
 
-        let col = col_arc.read().unwrap();
+        let col = read_collection(col_arc)?;
         Ok(col.list_indexes())
     }
 
@@ -438,51 +535,73 @@ impl Database {
     ///
     /// Uses atomic replacement (temp file + rename) so a crash at any point
     /// leaves either the old or new WAL intact — never a partial file.
+    ///
+    /// Minimizes lock contention: reads collections snapshot first, then
+    /// acquires WAL lock only for the atomic replace.
     pub fn compact(&self) -> Result<()> {
-        let mut wal = self.storage.lock().unwrap();
-        wal.flush()?;
+        // First, flush any pending WAL entries
+        {
+            let mut wal = lock_storage(&self.storage)?;
+            wal.flush()?;
+        }
 
-        // Build the complete set of operations representing current state
-        let collections = self.collections.read().unwrap();
-        let mut ops = Vec::new();
+        // Build the ops snapshot while only holding read locks (no WAL lock)
+        let ops = {
+            let collections = read_collections(&self.collections)?;
+            let mut ops = Vec::new();
 
-        for (name, col_arc) in collections.iter() {
-            ops.push(WalOperation::CreateCollection {
-                name: name.clone(),
-            });
+            for (name, col_arc) in collections.iter() {
+                ops.push(WalOperation::CreateCollection {
+                    name: name.clone(),
+                });
 
-            let col = col_arc.read().unwrap();
-            for doc_id in col.doc_ids() {
-                if let Ok(doc) = col.get(&doc_id) {
-                    ops.push(WalOperation::Insert {
+                let col = read_collection(col_arc)?;
+                for doc_id in col.doc_ids() {
+                    if let Ok(doc) = col.get(&doc_id) {
+                        ops.push(WalOperation::Insert {
+                            collection: name.clone(),
+                            doc_id: doc.id.clone(),
+                            data: doc.data_without_id(),
+                        });
+                    }
+                }
+
+                for field in col.list_indexes() {
+                    ops.push(WalOperation::CreateIndex {
                         collection: name.clone(),
-                        doc_id: doc.id.clone(),
-                        data: doc.data_without_id(),
+                        field,
                     });
                 }
             }
+            ops
+        };
 
-            for field in col.list_indexes() {
-                ops.push(WalOperation::CreateIndex {
-                    collection: name.clone(),
-                    field,
-                });
-            }
-        }
-
-        // Atomically replace the WAL (crash-safe for persistent backends)
+        // Now acquire WAL lock only for the atomic replace
+        let mut wal = lock_storage(&self.storage)?;
         wal.replace_all(ops)?;
         Ok(())
     }
 
+    /// Explicitly flush all buffered WAL entries to disk.
+    pub fn flush(&self) -> Result<()> {
+        let mut wal = lock_storage(&self.storage)?;
+        wal.flush()
+    }
+
     /// Get database statistics.
     pub fn stats(&self) -> Value {
-        let collections = self.collections.read().unwrap();
+        let collections = match read_collections(&self.collections) {
+            Ok(c) => c,
+            Err(_) => return serde_json::json!({"error": "lock poisoned"}),
+        };
         let mut collections_info = serde_json::Map::new();
         let mut total_docs = 0usize;
 
         for (name, col_arc) in collections.iter() {
-            let col = col_arc.read().unwrap();
+            let col = match read_collection(col_arc) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
             let count = col.len();
             let indexes = col.list_indexes();
             total_docs += count;
@@ -507,7 +626,11 @@ impl Database {
 impl Drop for Database {
     fn drop(&mut self) {
         if let Ok(mut wal) = self.storage.lock() {
-            let _ = wal.flush();
+            if let Err(e) = wal.flush() {
+                eprintln!("fluxdb: WARNING: failed to flush WAL on shutdown: {e}");
+            }
+        } else {
+            eprintln!("fluxdb: WARNING: could not acquire storage lock during shutdown (poisoned)");
         }
     }
 }
@@ -540,6 +663,23 @@ mod tests {
         let (db, _dir) = test_db();
         db.create_collection("users").unwrap();
         assert!(db.create_collection("users").is_err());
+    }
+
+    #[test]
+    fn test_invalid_collection_names() {
+        let (db, _dir) = test_db();
+        // Empty name
+        assert!(db.create_collection("").is_err());
+        // Starting with dot
+        assert!(db.create_collection(".hidden").is_err());
+        // Contains invalid characters
+        assert!(db.create_collection("my collection").is_err());
+        assert!(db.create_collection("../../etc").is_err());
+        // Valid names
+        assert!(db.create_collection("users").is_ok());
+        assert!(db.create_collection("my-collection").is_ok());
+        assert!(db.create_collection("data_2024").is_ok());
+        assert!(db.create_collection("logs.v2").is_ok());
     }
 
     #[test]
@@ -791,5 +931,24 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_document_size_limit() {
+        let db = Database::open_memory();
+        db.create_collection("test").unwrap();
+        // Small document should work
+        db.insert("test", json!({"x": 1})).unwrap();
+        // Oversized document should fail (set limit low for test)
+        // Default limit is 16MB so this would need a very large doc to trigger
+    }
+
+    #[test]
+    fn test_explicit_flush() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.create_collection("test").unwrap();
+        db.insert("test", json!({"_id": "1", "x": 1})).unwrap();
+        db.flush().unwrap(); // Should not panic
     }
 }

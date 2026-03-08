@@ -177,7 +177,7 @@ fn compare_values(doc_value: &Option<&Value>, target: &Value) -> Option<std::cmp
         (Value::Number(a), Value::Number(b)) => {
             let fa = a.as_f64()?;
             let fb = b.as_f64()?;
-            fa.partial_cmp(&fb)
+            Some(fa.total_cmp(&fb))
         }
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         _ => None,
@@ -195,7 +195,7 @@ pub fn compare_sort_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Number(na), Value::Number(nb)) => {
             let fa = na.as_f64()?;
             let fb = nb.as_f64()?;
-            fa.partial_cmp(&fb)
+            Some(fa.total_cmp(&fb))
         }
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         _ => None,

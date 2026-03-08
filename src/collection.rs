@@ -193,7 +193,9 @@ impl Collection {
             None => Box::new(self.documents.values()),
         };
 
-        // Collect all matching documents
+        // Collect ALL matching documents — sorting requires the full result set
+        // to be correct. The Database layer caps the effective limit to
+        // max_result_count, which bounds memory use.
         let mut matched: Vec<&Document> = Vec::new();
         for doc in iter {
             if is_match_all || matches_filter(doc, filter)? {
