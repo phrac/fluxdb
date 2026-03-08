@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::error::{FluxError, Result};
 
-const BATCH_SIZE_THRESHOLD: usize = 64;
-const BATCH_BYTES_THRESHOLD: usize = 64 * 1024;
+pub const DEFAULT_BATCH_SIZE: usize = 64;
+pub const DEFAULT_BATCH_BYTES: usize = 64 * 1024;
 
 /// A WAL entry representing a single mutation.
 pub struct WalEntry {
@@ -141,22 +141,38 @@ pub struct Wal {
     sequence: u64,
     buffer: Vec<u8>,
     pending_count: usize,
+    batch_size: usize,
+    batch_bytes: usize,
 }
 
 impl Wal {
-    /// Open or create a WAL file, reading existing entries to determine the next sequence number.
+    /// Open or create a WAL file with default batch settings.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_config(path, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES)
+    }
+
+    /// Open or create a WAL file with custom batch settings.
+    pub fn open_with_config(
+        path: &Path,
+        batch_size: usize,
+        batch_bytes: usize,
+    ) -> Result<Self> {
         let entries = if path.exists() {
             Self::read_all(path)?
         } else {
             Vec::new()
         };
         let sequence = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
-        Self::open_at_sequence(path, sequence)
+        Self::open_at_sequence(path, sequence, batch_size, batch_bytes)
     }
 
     /// Open a WAL file starting at a known sequence number (avoids re-reading entries).
-    pub fn open_at_sequence(path: &Path, sequence: u64) -> Result<Self> {
+    pub fn open_at_sequence(
+        path: &Path,
+        sequence: u64,
+        batch_size: usize,
+        batch_bytes: usize,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -172,6 +188,8 @@ impl Wal {
             sequence,
             buffer: Vec::new(),
             pending_count: 0,
+            batch_size,
+            batch_bytes,
         })
     }
 
@@ -201,8 +219,8 @@ impl Wal {
         self.pending_count += 1;
         self.sequence += 1;
 
-        if self.pending_count >= BATCH_SIZE_THRESHOLD
-            || self.buffer.len() >= BATCH_BYTES_THRESHOLD
+        if self.pending_count >= self.batch_size
+            || self.buffer.len() >= self.batch_bytes
         {
             self.flush()?;
         }
@@ -422,8 +440,8 @@ mod tests {
 
         {
             let mut wal = Wal::open(&wal_path).unwrap();
-            // Write more than BATCH_SIZE_THRESHOLD entries
-            for i in 0..BATCH_SIZE_THRESHOLD + 10 {
+            // Write more than DEFAULT_BATCH_SIZE entries
+            for i in 0..DEFAULT_BATCH_SIZE + 10 {
                 wal.append(WalOperation::Insert {
                     collection: "test".into(),
                     doc_id: format!("{i}"),
@@ -435,7 +453,7 @@ mod tests {
         }
 
         let entries = Wal::read_all(&wal_path).unwrap();
-        assert_eq!(entries.len(), BATCH_SIZE_THRESHOLD + 10);
+        assert_eq!(entries.len(), DEFAULT_BATCH_SIZE + 10);
     }
 
     #[test]

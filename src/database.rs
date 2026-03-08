@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::collection::Collection;
 use crate::document::Document;
 use crate::error::{FluxError, Result};
+use crate::config::Config;
 use crate::wal::{Wal, WalEntry, WalOperation};
 
 /// The main database engine.
@@ -23,8 +24,15 @@ pub struct Database {
 }
 
 impl Database {
-    /// Open or create a database at the given directory path.
+    /// Open or create a database with default settings.
     pub fn open(data_dir: &Path) -> Result<Self> {
+        Self::open_with_config(&Config::default(), Some(data_dir))
+    }
+
+    /// Open or create a database using the provided config.
+    /// If `data_dir_override` is Some, it takes precedence over config.data_dir.
+    pub fn open_with_config(config: &Config, data_dir_override: Option<&Path>) -> Result<Self> {
+        let data_dir = data_dir_override.unwrap_or(&config.data_dir);
         fs::create_dir_all(data_dir)?;
 
         let name = data_dir
@@ -39,7 +47,12 @@ impl Database {
         let entries = Wal::read_all(&wal_path)?;
         let next_seq = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
         let collections = Self::replay_entries(&entries)?;
-        let wal = Wal::open_at_sequence(&wal_path, next_seq)?;
+        let wal = Wal::open_at_sequence(
+            &wal_path,
+            next_seq,
+            config.wal.batch_size,
+            config.wal.batch_bytes,
+        )?;
 
         let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
             .into_iter()

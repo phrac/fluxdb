@@ -1,25 +1,43 @@
-use std::path::PathBuf;
+use std::fs;
 
+use clap::Parser;
+
+use fluxdb::config::{Cli, Config};
 use fluxdb::server::Server;
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse();
 
-    let data_dir = args
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./fluxdb_data"));
+    // Handle --init-config
+    if let Some(path) = &cli.init_config {
+        let config = Config::default();
+        let toml_str = config.to_toml_string();
+        if let Err(e) = fs::write(path, &toml_str) {
+            eprintln!("Failed to write config: {e}");
+            std::process::exit(1);
+        }
+        eprintln!("Wrote default config to {}", path.display());
+        return;
+    }
 
-    let addr = args
-        .get(2)
-        .map(String::as_str)
-        .unwrap_or("127.0.0.1:7654");
+    let config = match Config::load(&cli) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Config error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     eprintln!("FluxDB v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("Data directory: {}", data_dir.display());
+    eprintln!("Data directory: {}", config.data_dir.display());
+    eprintln!("Listening on:   {}", config.listen);
+    eprintln!(
+        "WAL batch:      {} entries / {} bytes",
+        config.wal.batch_size, config.wal.batch_bytes
+    );
 
-    let server = match Server::new(data_dir, addr) {
+    let server = match Server::from_config(&config) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to initialize database: {e}");

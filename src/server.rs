@@ -1,40 +1,25 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::config::Config;
 use crate::database::Database;
 
 /// TCP server that accepts JSON commands over newline-delimited protocol.
-///
-/// Commands:
-///   {"cmd": "create_collection", "name": "users"}
-///   {"cmd": "drop_collection", "name": "users"}
-///   {"cmd": "list_collections"}
-///   {"cmd": "insert", "collection": "users", "document": {...}}
-///   {"cmd": "get", "collection": "users", "id": "abc"}
-///   {"cmd": "update", "collection": "users", "id": "abc", "document": {...}}
-///   {"cmd": "delete", "collection": "users", "id": "abc"}
-///   {"cmd": "find", "collection": "users", "filter": {...}, "projection": {...}, "limit": 10, "skip": 0}
-///   {"cmd": "count", "collection": "users", "filter": {...}}
-///   {"cmd": "create_index", "collection": "users", "field": "age"}
-///   {"cmd": "drop_index", "collection": "users", "field": "age"}
-///   {"cmd": "list_indexes", "collection": "users"}
-///   {"cmd": "compact"}
-///   {"cmd": "stats"}
 pub struct Server {
     db: Arc<Database>,
     addr: String,
 }
 
 impl Server {
-    pub fn new(data_dir: PathBuf, addr: &str) -> crate::error::Result<Self> {
-        let db = Database::open(&data_dir)?;
+    /// Create a server from a Config.
+    pub fn from_config(config: &Config) -> crate::error::Result<Self> {
+        let db = Database::open_with_config(config, None)?;
         Ok(Server {
             db: Arc::new(db),
-            addr: addr.to_string(),
+            addr: config.listen.clone(),
         })
     }
 
