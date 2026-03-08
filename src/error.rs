@@ -11,6 +11,12 @@ pub enum FluxError {
     #[error("collection already exists: {0}")]
     CollectionAlreadyExists(String),
 
+    #[error("index already exists: {0}")]
+    IndexAlreadyExists(String),
+
+    #[error("index not found: {0}")]
+    IndexNotFound(String),
+
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 

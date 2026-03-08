@@ -2,6 +2,7 @@ pub mod collection;
 pub mod database;
 pub mod document;
 pub mod error;
+pub mod index;
 pub mod query;
 pub mod server;
 pub mod wal;

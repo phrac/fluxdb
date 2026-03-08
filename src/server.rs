@@ -4,14 +4,10 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
 use crate::database::Database;
 
 /// TCP server that accepts JSON commands over newline-delimited protocol.
-///
-/// Each request is a single JSON object on one line. Each response is a single
-/// JSON object on one line.
 ///
 /// Commands:
 ///   {"cmd": "create_collection", "name": "users"}
@@ -23,10 +19,13 @@ use crate::database::Database;
 ///   {"cmd": "delete", "collection": "users", "id": "abc"}
 ///   {"cmd": "find", "collection": "users", "filter": {...}, "projection": {...}, "limit": 10, "skip": 0}
 ///   {"cmd": "count", "collection": "users", "filter": {...}}
+///   {"cmd": "create_index", "collection": "users", "field": "age"}
+///   {"cmd": "drop_index", "collection": "users", "field": "age"}
+///   {"cmd": "list_indexes", "collection": "users"}
 ///   {"cmd": "compact"}
 ///   {"cmd": "stats"}
 pub struct Server {
-    db: Arc<Mutex<Database>>,
+    db: Arc<Database>,
     addr: String,
 }
 
@@ -34,7 +33,7 @@ impl Server {
     pub fn new(data_dir: PathBuf, addr: &str) -> crate::error::Result<Self> {
         let db = Database::open(&data_dir)?;
         Ok(Server {
-            db: Arc::new(Mutex::new(db)),
+            db: Arc::new(db),
             addr: addr.to_string(),
         })
     }
@@ -58,7 +57,7 @@ impl Server {
 
 async fn handle_client(
     stream: TcpStream,
-    db: Arc<Mutex<Database>>,
+    db: Arc<Database>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -69,7 +68,13 @@ async fn handle_client(
         }
 
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => process_command(&db, &request).await,
+            Ok(request) => {
+                let db = Arc::clone(&db);
+                // Run blocking database operations on a thread pool
+                tokio::task::spawn_blocking(move || process_command(&db, &request))
+                    .await
+                    .unwrap_or_else(|e| json!({"ok": false, "error": format!("internal error: {e}")}))
+            }
             Err(e) => json!({"ok": false, "error": format!("invalid JSON: {e}")}),
         };
 
@@ -82,7 +87,7 @@ async fn handle_client(
     Ok(())
 }
 
-async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
+fn process_command(db: &Database, request: &Value) -> Value {
     let cmd = match request["cmd"].as_str() {
         Some(c) => c,
         None => return json!({"ok": false, "error": "missing 'cmd' field"}),
@@ -94,7 +99,6 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
                 Some(n) => n,
                 None => return json!({"ok": false, "error": "missing 'name' field"}),
             };
-            let mut db = db.lock().await;
             match db.create_collection(name) {
                 Ok(()) => json!({"ok": true}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -106,7 +110,6 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
                 Some(n) => n,
                 None => return json!({"ok": false, "error": "missing 'name' field"}),
             };
-            let mut db = db.lock().await;
             match db.drop_collection(name) {
                 Ok(()) => json!({"ok": true}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -114,7 +117,6 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
         }
 
         "list_collections" => {
-            let db = db.lock().await;
             let collections = db.list_collections();
             json!({"ok": true, "collections": collections})
         }
@@ -126,9 +128,10 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
             };
             let document = match request.get("document") {
                 Some(d) if d.is_object() => d.clone(),
-                _ => return json!({"ok": false, "error": "missing or invalid 'document' field"}),
+                _ => {
+                    return json!({"ok": false, "error": "missing or invalid 'document' field"})
+                }
             };
-            let mut db = db.lock().await;
             match db.insert(collection, document) {
                 Ok(id) => json!({"ok": true, "id": id}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -144,7 +147,6 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
                 Some(i) => i,
                 None => return json!({"ok": false, "error": "missing 'id' field"}),
             };
-            let db = db.lock().await;
             match db.get(collection, id) {
                 Ok(doc) => json!({"ok": true, "document": doc}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -162,9 +164,10 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
             };
             let document = match request.get("document") {
                 Some(d) if d.is_object() => d.clone(),
-                _ => return json!({"ok": false, "error": "missing or invalid 'document' field"}),
+                _ => {
+                    return json!({"ok": false, "error": "missing or invalid 'document' field"})
+                }
             };
-            let mut db = db.lock().await;
             match db.update(collection, id, document) {
                 Ok(()) => json!({"ok": true}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -180,7 +183,6 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
                 Some(i) => i,
                 None => return json!({"ok": false, "error": "missing 'id' field"}),
             };
-            let mut db = db.lock().await;
             match db.delete(collection, id) {
                 Ok(deleted) => json!({"ok": true, "deleted": deleted}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -197,7 +199,6 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
             let limit = request["limit"].as_u64().map(|n| n as usize);
             let skip = request["skip"].as_u64().map(|n| n as usize);
 
-            let db = db.lock().await;
             match db.find(collection, filter, projection, limit, skip) {
                 Ok(docs) => json!({"ok": true, "documents": docs, "count": docs.len()}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -211,23 +212,59 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
             };
             let filter = request.get("filter").cloned().unwrap_or(json!({}));
 
-            let db = db.lock().await;
             match db.count(collection, filter) {
                 Ok(count) => json!({"ok": true, "count": count}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
         }
 
-        "compact" => {
-            let mut db = db.lock().await;
-            match db.compact() {
+        "create_index" => {
+            let collection = match request["collection"].as_str() {
+                Some(c) => c,
+                None => return json!({"ok": false, "error": "missing 'collection' field"}),
+            };
+            let field = match request["field"].as_str() {
+                Some(f) => f,
+                None => return json!({"ok": false, "error": "missing 'field' field"}),
+            };
+            match db.create_index(collection, field) {
                 Ok(()) => json!({"ok": true}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
         }
 
+        "drop_index" => {
+            let collection = match request["collection"].as_str() {
+                Some(c) => c,
+                None => return json!({"ok": false, "error": "missing 'collection' field"}),
+            };
+            let field = match request["field"].as_str() {
+                Some(f) => f,
+                None => return json!({"ok": false, "error": "missing 'field' field"}),
+            };
+            match db.drop_index(collection, field) {
+                Ok(()) => json!({"ok": true}),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+
+        "list_indexes" => {
+            let collection = match request["collection"].as_str() {
+                Some(c) => c,
+                None => return json!({"ok": false, "error": "missing 'collection' field"}),
+            };
+            match db.list_indexes(collection) {
+                Ok(indexes) => json!({"ok": true, "indexes": indexes}),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+
+        "compact" => match db.compact() {
+            Ok(()) => json!({"ok": true}),
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        },
+
         "stats" => {
-            let db = db.lock().await;
             let stats = db.stats();
             json!({"ok": true, "stats": stats})
         }
@@ -237,4 +274,3 @@ async fn process_command(db: &Arc<Mutex<Database>>, request: &Value) -> Value {
         }
     }
 }
-

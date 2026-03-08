@@ -2,17 +2,21 @@
 
 A document-oriented NoSQL database written in Rust.
 
-FluxDB stores JSON documents in named collections, supports MongoDB-style queries, and persists data using a write-ahead log with CRC32 integrity checks.
+FluxDB stores JSON documents in named collections, supports MongoDB-style queries with secondary index acceleration, and persists data using a write-ahead log with CRC32 integrity checks.
 
 ## Features
 
 - **Document storage** — JSON documents with auto-generated UUIDs or custom IDs
 - **Collections** — logical grouping of documents (like tables)
 - **Query engine** — MongoDB-compatible filter syntax with dot-notation field access
-- **Persistence** — append-only WAL with CRC32 checksums and crash recovery
+- **Secondary indexes** — B-tree indexes on arbitrary fields for fast equality and range queries
+- **Persistence** — append-only WAL with binary format, CRC32 checksums, and crash recovery
+- **Batched writes** — WAL entries are buffered and flushed in batches for throughput
+- **Concurrent reads** — per-collection RwLocks allow parallel read access
 - **Projections** — include/exclude fields from query results
 - **TCP server** — async multi-client server with line-delimited JSON protocol
 - **Compaction** — compact the WAL to reclaim space from deleted/updated documents
+- **Backward compatible** — automatically reads legacy JSON WAL files
 
 ## Quick start
 
@@ -69,6 +73,16 @@ Response:
 {"cmd": "delete", "collection": "users", "id": "550e8400-..."}
 ```
 
+### Secondary indexes
+
+```json
+{"cmd": "create_index", "collection": "users", "field": "age"}
+{"cmd": "list_indexes", "collection": "users"}
+{"cmd": "drop_index", "collection": "users", "field": "age"}
+```
+
+Indexes accelerate equality (`$eq`), range (`$gt`, `$gte`, `$lt`, `$lte`), and membership (`$in`) queries on the indexed field. Queries that can use an index will automatically do so.
+
 ### Other commands
 
 ```json
@@ -109,6 +123,7 @@ cargo run
 # In another terminal
 echo '{"cmd":"create_collection","name":"users"}' | nc localhost 7654
 echo '{"cmd":"insert","collection":"users","document":{"name":"Alice","age":30}}' | nc localhost 7654
+echo '{"cmd":"create_index","collection":"users","field":"age"}' | nc localhost 7654
 echo '{"cmd":"find","collection":"users","filter":{"age":{"$gte":25}}}' | nc localhost 7654
 echo '{"cmd":"stats"}' | nc localhost 7654
 ```
@@ -121,12 +136,21 @@ src/
   lib.rs         — module declarations
   error.rs       — error types
   document.rs    — JSON document model with dot-notation field access
-  collection.rs  — in-memory document collection with CRUD operations
+  collection.rs  — document collection with CRUD, index-accelerated queries
+  index.rs       — B-tree secondary indexes with range/equality lookups
   query.rs       — query filter evaluation and projection
-  wal.rs         — write-ahead log with CRC32 checksums
-  database.rs    — database engine, WAL replay, compaction
-  server.rs      — async TCP server (tokio)
+  wal.rs         — binary write-ahead log with CRC32 checksums, batched writes
+  database.rs    — database engine with per-collection RwLocks, WAL replay
+  server.rs      — async TCP server (tokio) with spawn_blocking for DB ops
 ```
+
+### Performance design
+
+- **Per-collection RwLock**: reads on different collections never block each other; reads on the same collection run concurrently; only writes acquire exclusive access to the target collection
+- **B-tree indexes**: equality and range queries on indexed fields skip full collection scans
+- **Batched WAL**: writes are buffered and flushed to disk in batches (64 entries or 64KB), reducing fsync overhead
+- **Binary WAL format**: length-prefixed binary entries with bincode serialization, faster to write and parse than JSON
+- **spawn_blocking**: database operations run on tokio's blocking thread pool, keeping the async runtime responsive
 
 ## Testing
 
@@ -134,4 +158,4 @@ src/
 cargo test
 ```
 
-37 unit tests covering documents, queries, collections, WAL persistence, crash recovery, and compaction.
+56 unit tests covering documents, queries, collections, indexes, WAL persistence, crash recovery, compaction, and concurrent access.
