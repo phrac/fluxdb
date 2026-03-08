@@ -1,8 +1,11 @@
-//! Comparison benchmarks: FluxDB vs SQLite vs RocksDB vs redb
+//! Comparison benchmarks: FluxDB vs SQLite vs RocksDB vs redb vs MongoDB
 //!
 //! All engines store the same JSON documents serialized as bytes,
 //! keyed by a string ID. This measures raw storage engine throughput
 //! on equivalent workloads.
+//!
+//! MongoDB benchmarks require a running `mongod` on localhost:27017.
+//! They are skipped automatically if the server is unreachable.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use serde_json::json;
@@ -341,6 +344,125 @@ mod redb_bench {
     }
 }
 
+// ── MongoDB ─────────────────────────────────────────────────────────────────
+
+mod mongodb_bench {
+    use super::*;
+    use mongodb::bson::{doc, Document};
+    use mongodb::sync::Client;
+
+    fn connect() -> Option<mongodb::sync::Collection<Document>> {
+        let client = Client::with_uri_str("mongodb://127.0.0.1:27017").ok()?;
+        // Quick connectivity check
+        client
+            .database("admin")
+            .run_command(doc! { "ping": 1 })
+            .run()
+            .ok()?;
+        let db = client.database("fluxdb_bench");
+        let _ = db.collection::<Document>("bench").drop().run();
+        Some(db.collection("bench"))
+    }
+
+    pub fn insert(c: &mut Criterion) {
+        let col = match connect() {
+            Some(c) => c,
+            None => {
+                eprintln!("MongoDB not available, skipping mongodb/insert");
+                return;
+            }
+        };
+
+        let mut i = 0usize;
+        c.bench_function("mongodb/insert", |b| {
+            b.iter(|| {
+                let doc = doc! {
+                    "_id": key(i),
+                    "name": format!("user{i}"),
+                    "age": ((i % 80) + 18) as i32,
+                    "email": format!("user{i}@example.com"),
+                    "active": i % 3 != 0,
+                    "tags": ["rust", "database"],
+                };
+                black_box(col.insert_one(doc).run().unwrap());
+                i += 1;
+            })
+        });
+    }
+
+    pub fn get(c: &mut Criterion) {
+        let col = match connect() {
+            Some(c) => c,
+            None => {
+                eprintln!("MongoDB not available, skipping mongodb/get");
+                return;
+            }
+        };
+
+        // Populate
+        let docs: Vec<Document> = (0..DOC_COUNT)
+            .map(|i| {
+                doc! {
+                    "_id": key(i),
+                    "name": format!("user{i}"),
+                    "age": ((i % 80) + 18) as i32,
+                    "email": format!("user{i}@example.com"),
+                    "active": i % 3 != 0,
+                    "tags": ["rust", "database"],
+                }
+            })
+            .collect();
+        col.insert_many(docs).run().unwrap();
+
+        let mut i = 0usize;
+        c.bench_function("mongodb/get", |b| {
+            b.iter(|| {
+                i = (i + 1) % DOC_COUNT;
+                let filter = doc! { "_id": key(i) };
+                black_box(col.find_one(filter).run().unwrap());
+            })
+        });
+    }
+
+    pub fn scan(c: &mut Criterion) {
+        let col = match connect() {
+            Some(c) => c,
+            None => {
+                eprintln!("MongoDB not available, skipping mongodb/scan_all");
+                return;
+            }
+        };
+
+        // Populate
+        let docs: Vec<Document> = (0..DOC_COUNT)
+            .map(|i| {
+                doc! {
+                    "_id": key(i),
+                    "name": format!("user{i}"),
+                    "age": ((i % 80) + 18) as i32,
+                    "email": format!("user{i}@example.com"),
+                    "active": i % 3 != 0,
+                    "tags": ["rust", "database"],
+                }
+            })
+            .collect();
+        col.insert_many(docs).run().unwrap();
+
+        c.bench_function("mongodb/scan_all", |b| {
+            b.iter(|| {
+                let mut count = 0;
+                let cursor = col.find(doc! {}).run().unwrap();
+                for result in cursor {
+                    let d: Document = result.unwrap();
+                    black_box(&d);
+                    count += 1;
+                }
+                black_box(count);
+            })
+        });
+    }
+}
+
 // ── Benchmark groups ────────────────────────────────────────────────────────
 
 criterion_group!(
@@ -357,5 +479,8 @@ criterion_group!(
     redb_bench::insert,
     redb_bench::get,
     redb_bench::scan,
+    mongodb_bench::insert,
+    mongodb_bench::get,
+    mongodb_bench::scan,
 );
 criterion_main!(comparison);
