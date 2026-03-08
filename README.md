@@ -56,30 +56,65 @@ cargo run --release -- --init-config fluxdb.toml
 
 ### Configuration
 
-FluxDB loads config from `fluxdb.toml` (current directory) or `/etc/fluxdb/fluxdb.toml`. CLI flags override file values.
+FluxDB loads config from three layers, each overriding the previous:
+
+1. **Defaults** — sensible out-of-the-box values
+2. **TOML file** — `fluxdb.toml` (current directory), `/etc/fluxdb/fluxdb.toml`, or `--config <path>`
+3. **CLI flags** — override any file or default value
+
+Generate a complete config file with all settings and comments:
+
+```bash
+cargo run --release -- --init-config fluxdb.toml
+```
+
+#### TOML reference
 
 ```toml
+# Directory where database files (WAL, collections) are stored.
 data_dir = "./fluxdb_data"
+
+# Address and port for the JSON protocol server.
 listen = "127.0.0.1:7654"
 
 [wal]
-batch_size = 64        # flush after N entries
-batch_bytes = 65536    # flush after N bytes
+# Number of WAL entries to buffer before flushing to disk.
+batch_size = 64
+# Byte threshold for the WAL write buffer before flushing.
+batch_bytes = 65536
 
 [redis]
+# Enable Redis-compatible protocol server.
 enabled = false
+# Address and port for the Redis protocol server.
 listen = "127.0.0.1:6379"
 
 [cluster]
+# Enable distributed cluster mode.
 enabled = false
+# Unique identifier for this node.
 node_id = "node-0"
+# Address for peer-to-peer communication between nodes.
 peer_listen = "127.0.0.1:7655"
 
+# List all nodes in the cluster.
 [[cluster.nodes]]
 id = "node-0"
 peer_addr = "127.0.0.1:7655"
 client_addr = "127.0.0.1:7654"
 ```
+
+#### CLI flags
+
+| Flag | TOML equivalent | Description |
+|------|-----------------|-------------|
+| `--config <path>` | — | Path to TOML config file |
+| `--data-dir <path>` | `data_dir` | Data directory |
+| `--listen <addr>` | `listen` | Server listen address |
+| `--wal-batch-size <n>` | `wal.batch_size` | WAL entries before flush |
+| `--wal-batch-bytes <n>` | `wal.batch_bytes` | WAL bytes before flush |
+| `--redis [addr]` | `redis.enabled` + `redis.listen` | Enable Redis protocol (optional address) |
+| `--init-config <path>` | — | Write default config to file and exit |
 
 ### Feature flags
 

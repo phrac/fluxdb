@@ -257,9 +257,32 @@ impl Config {
         ));
         out.push_str(&format!(
             "# Address and port for the Redis protocol server.\n\
-             listen = {:?}\n",
+             listen = {:?}\n\n",
             self.redis.listen
         ));
+        out.push_str("[cluster]\n");
+        out.push_str(&format!(
+            "# Enable distributed cluster mode.\n\
+             enabled = {}\n\n",
+            self.cluster.enabled
+        ));
+        out.push_str(&format!(
+            "# Unique identifier for this node.\n\
+             node_id = {:?}\n\n",
+            self.cluster.node_id
+        ));
+        out.push_str(&format!(
+            "# Address for peer-to-peer communication between nodes.\n\
+             peer_listen = {:?}\n\n",
+            self.cluster.peer_listen
+        ));
+        out.push_str(
+            "# List all nodes in the cluster.\n\
+             # [[cluster.nodes]]\n\
+             # id = \"node-0\"\n\
+             # peer_addr = \"127.0.0.1:7655\"\n\
+             # client_addr = \"127.0.0.1:7654\"\n",
+        );
         out
     }
 }
