@@ -41,17 +41,66 @@ cargo bench --bench comparison
 - **TOML configuration** — file-based config with CLI flag overrides
 - **Backward compatible** — reads legacy JSON-format WAL files automatically
 
-## Quick start
+## Getting started
+
+### Docker (recommended)
 
 ```bash
-# Build and run with defaults (listens on 127.0.0.1:7654, data in ./fluxdb_data)
-cargo run --release
+# Single node
+docker compose up -d
 
-# Or specify options
-cargo run --release -- --listen 0.0.0.0:7654 --data-dir /var/lib/fluxdb
+# Verify it's running
+echo '{"cmd":"stats"}' | nc localhost 7654
+```
 
-# Generate a default config file
-cargo run --release -- --init-config fluxdb.toml
+This starts FluxDB with the JSON protocol on port 7654 and Redis protocol on port 6379. Data is persisted in a Docker volume.
+
+To run a **3-node cluster**, edit `docker-compose.yml` — uncomment the cluster services and comment out the single-node service, then:
+
+```bash
+docker compose up -d
+```
+
+Pre-built cluster configs are in the `cluster/` directory using Docker networking (service names as hostnames).
+
+### Docker (manual)
+
+```bash
+docker build -t fluxdb .
+docker run -d -p 7654:7654 -v fluxdb-data:/var/lib/fluxdb fluxdb
+```
+
+### From source
+
+```bash
+cargo build --release
+./target/release/fluxdb
+
+# Or with Redis protocol
+cargo build --release --features redis
+./target/release/fluxdb --redis
+
+# Generate a config file
+./target/release/fluxdb --init-config fluxdb.toml
+```
+
+Defaults to `./fluxdb_data` for data and `127.0.0.1:7654` for the JSON protocol.
+
+### Try it out
+
+```bash
+# Create a collection
+echo '{"cmd":"create_collection","name":"users"}' | nc localhost 7654
+
+# Insert a document
+echo '{"cmd":"insert","collection":"users","document":{"name":"Alice","age":30}}' | nc localhost 7654
+
+# Query it back
+echo '{"cmd":"find","collection":"users","filter":{"age":{"$gte":25}}}' | nc localhost 7654
+
+# Or use Redis protocol
+redis-cli SET hello world
+redis-cli GET hello
 ```
 
 ### Configuration
