@@ -205,20 +205,110 @@ Supported commands: `GET`, `SET`, `DEL`, `EXISTS`, `KEYS`, `MSET`, `MGET`, `HSET
 
 ## Cluster mode
 
-FluxDB supports horizontal scaling via consistent-hash sharding across multiple nodes.
+FluxDB supports horizontal scaling via consistent-hash sharding across multiple nodes. Any node in the cluster can accept any request — it will automatically route the operation to the correct owner.
+
+### Starting a cluster
+
+Build with the `cluster` feature and give each node its own config:
 
 ```bash
 cargo run --release --features cluster -- --config node0.toml
+cargo run --release --features cluster -- --config node1.toml
+cargo run --release --features cluster -- --config node2.toml
 ```
 
-Each node gets a static configuration listing all cluster members. Documents are automatically routed to the correct node based on `hash(collection, doc_id)`:
+Each node's TOML config lists every member of the cluster:
 
-- **Point operations** (get, insert, update, delete) are routed to the owning node
-- **Queries** (find, count) use scatter-gather across all nodes
-- **DDL** (create_collection, create_index) is broadcast to all nodes
-- **Health monitoring** pings peers every 5 seconds with automatic failure detection
+```toml
+# node0.toml
+[cluster]
+enabled = true
+node_id = "node-0"
+peer_listen = "10.0.0.1:7655"
 
-The consistent hash ring uses 128 virtual nodes per physical node, ensuring minimal data movement when nodes are added or removed (~25% redistribution per new node).
+[[cluster.nodes]]
+id = "node-0"
+peer_addr = "10.0.0.1:7655"
+client_addr = "10.0.0.1:7654"
+
+[[cluster.nodes]]
+id = "node-1"
+peer_addr = "10.0.0.2:7655"
+client_addr = "10.0.0.2:7654"
+
+[[cluster.nodes]]
+id = "node-2"
+peer_addr = "10.0.0.3:7655"
+client_addr = "10.0.0.3:7654"
+```
+
+Clients connect to any node's `client_addr`. The cluster handles routing transparently.
+
+### How sharding works
+
+FluxDB uses a **consistent hash ring** to distribute documents across nodes. The shard key is `hash(collection + "/" + doc_id)` using CRC32:
+
+```
+                    ┌──────────────┐
+               ┌────┤   Hash Ring   ├────┐
+               │    └──────────────┘    │
+               ▼                        ▼
+         ┌──────────┐            ┌──────────┐
+         │  node-0  │            │  node-1  │
+         │  owns     │            │  owns     │
+         │  sector A │            │  sector B │
+         └──────────┘            └──────────┘
+               ▲                        ▲
+               │    ┌──────────────┐    │
+               └────┤   node-2    ├────┘
+                    │   owns       │
+                    │   sector C   │
+                    └──────────────┘
+```
+
+Each physical node gets **128 virtual nodes** spread around the ring. When a request arrives:
+
+1. The router computes `crc32("collection/doc_id")`
+2. Walks clockwise around the ring to find the first virtual node at or after that position
+3. Maps the virtual node back to its physical node — that's the owner
+
+This guarantees even distribution (~33% per node in a 3-node cluster) and minimal disruption when scaling: adding a 4th node only moves ~25% of documents (the theoretical minimum of 1/N).
+
+### Operation routing
+
+Different operations are handled differently across the cluster:
+
+| Operation | Strategy | Description |
+|-----------|----------|-------------|
+| `get`, `update`, `delete` | **Point route** | Hashed to the owning node by `(collection, id)` |
+| `insert` | **Point route** | If no `_id` is provided, a UUID is generated first so routing is deterministic |
+| `find` | **Scatter-gather** | Sent to all nodes in parallel; results are merged with skip/limit applied after merge |
+| `count` | **Scatter-gather** | Sent to all nodes in parallel; counts are summed |
+| `list_collections` | **Scatter-gather** | Union of collections from all nodes |
+| `create_collection`, `drop_collection` | **Broadcast** | Executed on every node |
+| `create_index`, `drop_index` | **Broadcast** | Executed on every node |
+| `compact`, `stats` | **Local only** | Runs on the node that received the request |
+
+For scatter-gather queries with `limit` and `skip`, each node returns up to `limit + skip` results. The router then merges all results, applies `skip`, and truncates to `limit` — ensuring correct pagination without missing documents.
+
+### Peer communication
+
+Nodes communicate over persistent TCP connections using the same JSON line-delimited protocol as clients. Requests forwarded between nodes carry a `_routed: true` flag to prevent infinite forwarding loops. Connections auto-reconnect on failure with a 5-second connect timeout and 10-second request timeout.
+
+### Health monitoring
+
+A background health checker pings every peer every 5 seconds using `stats` commands. A node is marked **unhealthy** after 3 consecutive failures and automatically recovers when it responds again. Cluster health is visible via the `cluster_status` command:
+
+```json
+{"cmd": "cluster_status"}
+```
+
+### Scaling considerations
+
+- **Static membership** — all nodes share the same config file listing every member. To add a node, update the config on all nodes and restart. The consistent hash ring ensures only ~1/N of documents need to move.
+- **No replication** — each document lives on exactly one node. Node failure means that shard's data is unavailable until the node recovers (data is still on disk via the WAL).
+- **No rebalancing** — when nodes are added, existing data stays in place. New writes are correctly routed; old data can be migrated by re-inserting.
+- **Network partition** — during a partition, each side continues serving its local data. Scatter-gather queries return partial results from reachable nodes.
 
 ## Architecture
 
