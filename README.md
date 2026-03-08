@@ -10,11 +10,11 @@ Benchmarked against established storage engines on equivalent workloads (10,000 
 
 | Operation | FluxDB | SQLite (WAL) | RocksDB | redb | MongoDB |
 |-----------|-------:|-------------:|--------:|-----:|--------:|
-| **Insert** | **2.8 µs** | 12.4 µs | 2.7 µs | 4,730 µs | 55.3 µs |
-| **Get** | **400 ns** | 1,230 ns | 444 ns | 639 ns | 58,517 ns |
-| **Scan 10K** | **18 µs** | 1,053 µs | 818 µs | 353 µs | 10,802 µs |
+| **Insert** | **2.4 µs** | 12.1 µs | 2.6 µs | 4,520 µs | 54.8 µs |
+| **Get** | **412 ns** | 1,241 ns | 422 ns | 689 ns | 58,407 ns |
+| **Scan 10K** | **25.7 µs** | 1,037 µs | 818 µs | 360 µs | 10,747 µs |
 
-FluxDB's zero-copy scan path is 19x faster than redb and 58x faster than SQLite. Point reads are 3x faster than SQLite, on par with RocksDB.
+FluxDB's zero-copy scan path is 14x faster than redb and 40x faster than SQLite. Point reads are 3x faster than SQLite, on par with RocksDB. Inserts are 5x faster than SQLite and 23x faster than MongoDB.
 
 Run the benchmarks yourself:
 
@@ -26,9 +26,11 @@ cargo bench --bench comparison
 
 - **Document storage** — JSON documents with auto-generated UUIDs or custom IDs
 - **Collections** — logical grouping of documents
-- **Query engine** — MongoDB-compatible filter syntax (`$eq`, `$gt`, `$in`, `$or`, `$and`, `$not`, `$exists`, etc.) with dot-notation for nested fields
-- **Secondary indexes** — B-tree indexes on arbitrary fields for fast equality and range queries
+- **Query engine** — MongoDB-compatible filter syntax (`$eq`, `$gt`, `$in`, `$or`, `$and`, `$not`, `$exists`, etc.) with dot-notation for nested fields and field-level `$not`
+- **Sort** — `{"sort": {"field": 1}}` for ascending, `-1` for descending, multi-field supported
+- **Secondary indexes** — B-tree indexes on arbitrary fields with type-unified numeric keys; `$or` and `$and` branches use indexes automatically with selectivity-first intersection
 - **Projections** — include/exclude specific fields from query results
+- **Deterministic pagination** — BTreeMap-backed storage ensures `skip`/`limit` always returns consistent results
 - **Crash-safe WAL** — binary write-ahead log with CRC32 checksums, atomic compaction via temp-file + rename, and corruption recovery
 - **Batched writes** — WAL entries are buffered and flushed in batches (configurable) for throughput
 - **Zero-copy scans** — pre-serialized document cache enables bulk reads without per-document serialization
@@ -212,8 +214,10 @@ Response:
 ### Find documents with a filter
 
 ```json
-{"cmd": "find", "collection": "users", "filter": {"age": {"$gte": 25}}, "limit": 10, "skip": 0}
+{"cmd": "find", "collection": "users", "filter": {"age": {"$gte": 25}}, "sort": {"age": -1}, "limit": 10, "skip": 0}
 ```
+
+The `sort`, `limit`, and `skip` parameters are all optional. Sort values are `1` (ascending) or `-1` (descending). Multi-field sort is supported.
 
 ### Update a document
 
@@ -421,7 +425,8 @@ src/
 ### Design
 
 - **Per-collection RwLock** — reads on different collections never block each other; only writes acquire exclusive access
-- **B-tree indexes** — equality and range queries skip full collection scans
+- **BTreeMap storage** — documents stored in sorted order by ID for deterministic iteration; pagination with `skip`/`limit` always returns consistent results
+- **B-tree indexes** — equality and range queries skip full collection scans; unified numeric keys (integer and float share the same index bucket); `$or` unions and `$and` intersections are index-aware with selectivity-first ordering
 - **Zero-copy scans** — documents cache their serialized bytes; bulk scans avoid per-document serialization
 - **Batched WAL** — writes are buffered (64 entries or 64 KB by default), reducing fsync overhead
 - **Atomic compaction** — WAL compaction writes to a temp file and atomically renames, ensuring crash safety
@@ -431,8 +436,8 @@ src/
 ## Testing
 
 ```bash
-cargo test                    # 66 tests (core + server)
-cargo test --features cluster # 76 tests (adds cluster integration)
+cargo test                    # 76 tests (core + server)
+cargo test --features cluster # 86 tests (adds cluster integration)
 ```
 
-Covers documents, queries, collections, indexes, WAL persistence, crash recovery, CRC corruption recovery, atomic compaction, concurrent access, hash ring distribution, and cluster routing.
+Covers documents, queries, projections, sort, field-level `$not`, collections, indexes (including cross-type numeric and `$or`/`$and` index usage), WAL persistence, crash recovery, CRC corruption recovery, atomic compaction, deterministic pagination, concurrent access, hash ring distribution, and cluster routing.

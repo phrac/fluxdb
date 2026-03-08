@@ -101,7 +101,7 @@ fn bench_find_scan(c: &mut Criterion) {
     c.bench_function("find_scan/10k", |b| {
         b.iter(|| {
             black_box(
-                db.find("bench", json!({"age": 42}), None, None, None)
+                db.find("bench", json!({"age": 42}), None, None, None, None)
                     .unwrap(),
             );
         })
@@ -125,7 +125,7 @@ fn bench_find_indexed(c: &mut Criterion) {
     c.bench_function("find_indexed/10k", |b| {
         b.iter(|| {
             black_box(
-                db.find("bench", json!({"age": 42}), None, None, None)
+                db.find("bench", json!({"age": 42}), None, None, None, None)
                     .unwrap(),
             );
         })
@@ -152,6 +152,7 @@ fn bench_find_range_indexed(c: &mut Criterion) {
                 db.find(
                     "bench",
                     json!({"score": {"$gte": 4000, "$lt": 6000}}),
+                    None,
                     None,
                     None,
                     None,
