@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Bound;
 
 use serde_json::Value;
@@ -6,22 +6,25 @@ use serde_json::Value;
 use crate::document::Document;
 use crate::error::{FluxError, Result};
 use crate::index::{IndexKey, SecondaryIndex};
-use crate::query::{apply_projection, matches_filter};
+use crate::query::{apply_projection, compare_sort_values, matches_filter};
 
 /// A collection is a named group of documents, analogous to a table in SQL.
+///
+/// Documents are stored in a `BTreeMap` keyed by ID for deterministic
+/// iteration order, which makes `skip`/`limit` pagination stable.
 #[derive(Debug)]
 pub struct Collection {
     pub name: String,
-    documents: HashMap<String, Document>,
-    indexes: HashMap<String, SecondaryIndex>,
+    documents: BTreeMap<String, Document>,
+    indexes: BTreeMap<String, SecondaryIndex>,
 }
 
 impl Collection {
     pub fn new(name: String) -> Self {
         Collection {
             name,
-            documents: HashMap::new(),
-            indexes: HashMap::new(),
+            documents: BTreeMap::new(),
+            indexes: BTreeMap::new(),
         }
     }
 
@@ -93,7 +96,7 @@ impl Collection {
         true
     }
 
-    /// Find all documents matching a filter, with optional projection.
+    /// Find all documents matching a filter, with optional projection and sort.
     /// Uses secondary indexes when possible to narrow the scan.
     pub fn find(
         &self,
@@ -101,19 +104,28 @@ impl Collection {
         projection: Option<&Value>,
         limit: Option<usize>,
         skip: Option<usize>,
+        sort: Option<&Value>,
     ) -> Result<Vec<Value>> {
         let is_match_all = filter.as_object().map_or(false, |m| m.is_empty());
         let has_projection = projection
             .and_then(|p| p.as_object())
             .map_or(false, |o| !o.is_empty());
+        let has_sort = sort
+            .and_then(|s| s.as_object())
+            .map_or(false, |o| !o.is_empty());
 
-        // Ultra-fast path: full scan, no filter, no projection, no skip/limit
-        if is_match_all && !has_projection && skip.is_none() && limit.is_none() {
+        // Ultra-fast path: full scan, no filter, no projection, no skip/limit, no sort
+        if is_match_all && !has_projection && !has_sort && skip.is_none() && limit.is_none() {
             let mut results = Vec::with_capacity(self.documents.len());
             for doc in self.documents.values() {
                 results.push(doc.to_value());
             }
             return Ok(results);
+        }
+
+        // When sort is specified, we must collect all matches before applying skip/limit
+        if has_sort {
+            return self.find_sorted(filter, projection, limit, skip, sort.unwrap());
         }
 
         let capacity = if is_match_all { self.documents.len() } else { 16 };
@@ -154,6 +166,104 @@ impl Collection {
         }
 
         Ok(results)
+    }
+
+    /// Find with sort: collect all matches, sort, then apply skip/limit/projection.
+    fn find_sorted(
+        &self,
+        filter: &Value,
+        projection: Option<&Value>,
+        limit: Option<usize>,
+        skip: Option<usize>,
+        sort_spec: &Value,
+    ) -> Result<Vec<Value>> {
+        let is_match_all = filter.as_object().map_or(false, |m| m.is_empty());
+        let has_projection = projection
+            .and_then(|p| p.as_object())
+            .map_or(false, |o| !o.is_empty());
+
+        let candidate_ids = if is_match_all {
+            None
+        } else {
+            self.try_index_scan(filter)
+        };
+
+        let iter: Box<dyn Iterator<Item = &Document>> = match &candidate_ids {
+            Some(ids) => Box::new(ids.iter().filter_map(|id| self.documents.get(id))),
+            None => Box::new(self.documents.values()),
+        };
+
+        // Collect all matching documents
+        let mut matched: Vec<&Document> = Vec::new();
+        for doc in iter {
+            if is_match_all || matches_filter(doc, filter)? {
+                matched.push(doc);
+            }
+        }
+
+        // Parse sort spec: Vec<(field, ascending)>
+        let sort_fields = Self::parse_sort_spec(sort_spec)?;
+
+        // Sort
+        matched.sort_by(|a, b| {
+            for (field, ascending) in &sort_fields {
+                let va = a.get_field(field);
+                let vb = b.get_field(field);
+                let ord = match (va, vb) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(a), Some(b)) => {
+                        compare_sort_values(a, b).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                };
+                let ord = if *ascending { ord } else { ord.reverse() };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        // Apply skip/limit and projection
+        let skip_count = skip.unwrap_or(0);
+        let iter = matched.into_iter().skip(skip_count);
+        let iter: Box<dyn Iterator<Item = &Document>> = match limit {
+            Some(lim) => Box::new(iter.take(lim)),
+            None => Box::new(iter),
+        };
+
+        let mut results = Vec::new();
+        for doc in iter {
+            let mut val = doc.to_value();
+            if has_projection {
+                apply_projection(&mut val, projection.unwrap())?;
+            }
+            results.push(val);
+        }
+
+        Ok(results)
+    }
+
+    /// Parse a sort spec like `{"age": 1, "name": -1}` into field/direction pairs.
+    fn parse_sort_spec(sort_spec: &Value) -> Result<Vec<(String, bool)>> {
+        let obj = sort_spec.as_object().ok_or_else(|| {
+            FluxError::InvalidQuery("sort must be a JSON object".into())
+        })?;
+        let mut fields = Vec::with_capacity(obj.len());
+        for (field, dir) in obj {
+            let ascending = match dir.as_i64() {
+                Some(1) => true,
+                Some(-1) => false,
+                _ => {
+                    return Err(FluxError::InvalidQuery(
+                        "sort values must be 1 (ascending) or -1 (descending)".into(),
+                    ))
+                }
+            };
+            fields.push((field.clone(), ascending));
+        }
+        Ok(fields)
     }
 
     /// Find documents and return pre-serialized JSON bytes for each match.
@@ -292,41 +402,92 @@ impl Collection {
     /// Returns candidate doc IDs if an index applies, or None for a full scan.
     fn try_index_scan(&self, filter: &Value) -> Option<Vec<String>> {
         let filter_obj = filter.as_object()?;
-        let mut best_candidates: Option<HashSet<String>> = None;
+
+        // Collect all candidate sets from indexable conditions
+        let mut candidate_sets: Vec<HashSet<String>> = Vec::new();
 
         for (field, condition) in filter_obj {
-            if field.starts_with('$') {
-                continue;
-            }
-
-            let index = match self.indexes.get(field.as_str()) {
-                Some(idx) => idx,
-                None => continue,
-            };
-
-            let candidates = if let Some(cond_obj) = condition.as_object() {
-                if cond_obj.keys().any(|k| k.starts_with('$')) {
-                    match Self::eval_index_operators(index, cond_obj) {
-                        Some(c) => c,
-                        None => continue,
+            match field.as_str() {
+                "$and" => {
+                    // Each $and branch can narrow candidates via intersection
+                    if let Some(branches) = condition.as_array() {
+                        for branch in branches {
+                            if let Some(ids) = self.try_index_scan(branch) {
+                                candidate_sets.push(ids.into_iter().collect());
+                            }
+                        }
                     }
-                } else {
-                    // Non-operator object value — not indexable
+                }
+                "$or" => {
+                    // All branches must be indexable; union the results
+                    if let Some(branches) = condition.as_array() {
+                        let mut union = HashSet::new();
+                        let mut all_indexed = true;
+                        for branch in branches {
+                            if let Some(ids) = self.try_index_scan(branch) {
+                                union.extend(ids);
+                            } else {
+                                all_indexed = false;
+                                break;
+                            }
+                        }
+                        if all_indexed && !union.is_empty() {
+                            candidate_sets.push(union);
+                        }
+                    }
+                }
+                _ if field.starts_with('$') => {
+                    // Other operators like $not — skip
                     continue;
                 }
-            } else {
-                // Implicit $eq
-                let key = IndexKey::from_value(condition)?;
-                index.lookup_eq(&key)
-            };
+                _ => {
+                    // Regular field condition
+                    let index = match self.indexes.get(field.as_str()) {
+                        Some(idx) => idx,
+                        None => continue,
+                    };
 
-            best_candidates = Some(match best_candidates {
-                Some(existing) => existing.intersection(&candidates).cloned().collect(),
-                None => candidates,
-            });
+                    if let Some(candidates) = self.eval_field_index(index, condition) {
+                        candidate_sets.push(candidates);
+                    }
+                }
+            }
         }
 
-        best_candidates.map(|set| set.into_iter().collect())
+        if candidate_sets.is_empty() {
+            return None;
+        }
+
+        // Sort by size (smallest first) for efficient intersection
+        candidate_sets.sort_by_key(|s| s.len());
+
+        // Intersect all sets, starting with the smallest
+        let mut result = candidate_sets.swap_remove(0);
+        for other in &candidate_sets {
+            result.retain(|id| other.contains(id));
+            if result.is_empty() {
+                break;
+            }
+        }
+
+        Some(result.into_iter().collect())
+    }
+
+    /// Evaluate a single field condition against an index, returning candidate doc IDs.
+    fn eval_field_index(
+        &self,
+        index: &SecondaryIndex,
+        condition: &Value,
+    ) -> Option<HashSet<String>> {
+        if let Some(cond_obj) = condition.as_object() {
+            if cond_obj.keys().any(|k| k.starts_with('$')) {
+                return Self::eval_index_operators(index, cond_obj);
+            }
+        }
+
+        // Implicit $eq
+        let key = IndexKey::from_value(condition)?;
+        Some(index.lookup_eq(&key).cloned().unwrap_or_default())
     }
 
     /// Evaluate operator conditions against an index, returning candidate doc IDs.
@@ -383,14 +544,16 @@ impl Collection {
         }
 
         if let Some(key) = eq_value {
-            return Some(index.lookup_eq(&key));
+            return Some(index.lookup_eq(&key).cloned().unwrap_or_default());
         }
 
         if let Some(values) = in_values {
             let mut result = HashSet::new();
             for val in values {
                 if let Some(key) = IndexKey::from_value(val) {
-                    result.extend(index.lookup_eq(&key));
+                    if let Some(ids) = index.lookup_eq(&key) {
+                        result.extend(ids.iter().cloned());
+                    }
                 }
             }
             return Some(result);
@@ -461,7 +624,7 @@ mod tests {
         ));
 
         let results = col
-            .find(&json!({"age": {"$gte": 30}}), None, None, None)
+            .find(&json!({"age": {"$gte": 30}}), None, None, None, None)
             .unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -473,8 +636,86 @@ mod tests {
             col.insert(Document::new(json!({"_id": format!("{i}"), "n": i})));
         }
 
-        let results = col.find(&json!({}), None, Some(3), Some(2)).unwrap();
+        let results = col.find(&json!({}), None, Some(3), Some(2), None).unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_deterministic_skip_limit() {
+        let mut col = Collection::new("test".into());
+        for i in 0..20 {
+            col.insert(Document::new(
+                json!({"_id": format!("doc-{i:03}"), "val": i}),
+            ));
+        }
+
+        // Same skip/limit should always return the same results
+        let r1 = col.find(&json!({}), None, Some(5), Some(3), None).unwrap();
+        let r2 = col.find(&json!({}), None, Some(5), Some(3), None).unwrap();
+        assert_eq!(r1, r2);
+
+        // Verify they're sorted by _id (BTreeMap order)
+        let ids: Vec<&str> = r1.iter().map(|v| v["_id"].as_str().unwrap()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+    }
+
+    #[test]
+    fn test_find_with_sort() {
+        let mut col = Collection::new("test".into());
+        col.insert(Document::new(json!({"_id": "1", "name": "Charlie", "age": 35})));
+        col.insert(Document::new(json!({"_id": "2", "name": "Alice", "age": 30})));
+        col.insert(Document::new(json!({"_id": "3", "name": "Bob", "age": 25})));
+
+        // Sort by age ascending
+        let results = col
+            .find(&json!({}), None, None, None, Some(&json!({"age": 1})))
+            .unwrap();
+        assert_eq!(results[0]["name"], "Bob");
+        assert_eq!(results[1]["name"], "Alice");
+        assert_eq!(results[2]["name"], "Charlie");
+
+        // Sort by age descending
+        let results = col
+            .find(&json!({}), None, None, None, Some(&json!({"age": -1})))
+            .unwrap();
+        assert_eq!(results[0]["name"], "Charlie");
+        assert_eq!(results[1]["name"], "Alice");
+        assert_eq!(results[2]["name"], "Bob");
+
+        // Sort by name ascending
+        let results = col
+            .find(&json!({}), None, None, None, Some(&json!({"name": 1})))
+            .unwrap();
+        assert_eq!(results[0]["name"], "Alice");
+        assert_eq!(results[1]["name"], "Bob");
+        assert_eq!(results[2]["name"], "Charlie");
+    }
+
+    #[test]
+    fn test_sort_with_skip_limit() {
+        let mut col = Collection::new("test".into());
+        for i in 0..10 {
+            col.insert(Document::new(
+                json!({"_id": format!("{i}"), "score": (9 - i) * 10}),
+            ));
+        }
+
+        // Sort by score ascending, skip 2, limit 3 → should get scores 20, 30, 40
+        let results = col
+            .find(
+                &json!({}),
+                None,
+                Some(3),
+                Some(2),
+                Some(&json!({"score": 1})),
+            )
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["score"], 20);
+        assert_eq!(results[1]["score"], 30);
+        assert_eq!(results[2]["score"], 40);
     }
 
     #[test]
@@ -502,7 +743,7 @@ mod tests {
         ));
 
         let results = col
-            .find(&json!({}), Some(&json!({"name": 1})), None, None)
+            .find(&json!({}), Some(&json!({"name": 1})), None, None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].get("name").is_some());
@@ -526,13 +767,41 @@ mod tests {
         col.create_index("age").unwrap();
 
         // Exact match via index
-        let results = col.find(&json!({"age": 30}), None, None, None).unwrap();
+        let results = col.find(&json!({"age": 30}), None, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["name"], "Alice");
 
         // Range via index
         let results = col
-            .find(&json!({"age": {"$gte": 30}}), None, None, None)
+            .find(&json!({"age": {"$gte": 30}}), None, None, None, None)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_index_cross_type_numeric() {
+        // Integer and float queries should find each other's documents
+        let mut col = Collection::new("test".into());
+        col.create_index("val").unwrap();
+
+        col.insert(Document::new(json!({"_id": "1", "val": 50})));    // i64
+        col.insert(Document::new(json!({"_id": "2", "val": 50.0})));  // f64
+
+        // Query with float should find integer doc
+        let results = col
+            .find(&json!({"val": 50.0}), None, None, None, None)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Query with integer should find float doc
+        let results = col
+            .find(&json!({"val": 50}), None, None, None, None)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Range query across types
+        let results = col
+            .find(&json!({"val": {"$gte": 49.5, "$lte": 50.5}}), None, None, None, None)
             .unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -543,7 +812,7 @@ mod tests {
         col.create_index("age").unwrap();
 
         col.insert(Document::new(json!({"_id": "1", "age": 30})));
-        let results = col.find(&json!({"age": 30}), None, None, None).unwrap();
+        let results = col.find(&json!({"age": 30}), None, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -556,11 +825,11 @@ mod tests {
         col.update("1", json!({"age": 40})).unwrap();
 
         // Old value no longer indexed
-        let results = col.find(&json!({"age": 30}), None, None, None).unwrap();
+        let results = col.find(&json!({"age": 30}), None, None, None, None).unwrap();
         assert_eq!(results.len(), 0);
 
         // New value is indexed
-        let results = col.find(&json!({"age": 40}), None, None, None).unwrap();
+        let results = col.find(&json!({"age": 40}), None, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -572,7 +841,7 @@ mod tests {
         col.insert(Document::new(json!({"_id": "1", "age": 30})));
         col.delete("1");
 
-        let results = col.find(&json!({"age": 30}), None, None, None).unwrap();
+        let results = col.find(&json!({"age": 30}), None, None, None, None).unwrap();
         assert_eq!(results.len(), 0);
     }
 
@@ -591,6 +860,7 @@ mod tests {
         let results = col
             .find(
                 &json!({"score": {"$gte": 50, "$lt": 75}}),
+                None,
                 None,
                 None,
                 None,
@@ -620,9 +890,58 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_or_index_usage() {
+        let mut col = Collection::new("test".into());
+        col.create_index("age").unwrap();
+
+        for i in 0..100 {
+            col.insert(Document::new(
+                json!({"_id": format!("{i}"), "age": i}),
+            ));
+        }
+
+        // $or with all branches indexable
+        let results = col
+            .find(
+                &json!({"$or": [{"age": 10}, {"age": 20}, {"age": 30}]}),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_and_index_usage() {
+        let mut col = Collection::new("test".into());
+        col.create_index("age").unwrap();
+        col.create_index("status").unwrap();
+
+        col.insert(Document::new(json!({"_id": "1", "age": 30, "status": "active"})));
+        col.insert(Document::new(json!({"_id": "2", "age": 30, "status": "inactive"})));
+        col.insert(Document::new(json!({"_id": "3", "age": 25, "status": "active"})));
+
+        // $and with both branches indexable
+        let results = col
+            .find(
+                &json!({"$and": [{"age": 30}, {"status": "active"}]}),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["_id"], "1");
     }
 
     #[test]

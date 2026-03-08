@@ -322,6 +322,7 @@ impl Database {
         projection: Option<Value>,
         limit: Option<usize>,
         skip: Option<usize>,
+        sort: Option<Value>,
     ) -> Result<Vec<Value>> {
         let collections = self.collections.read().unwrap();
         let col_arc = collections
@@ -329,7 +330,7 @@ impl Database {
             .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?;
 
         let col = col_arc.read().unwrap();
-        col.find(&filter, projection.as_ref(), limit, skip)
+        col.find(&filter, projection.as_ref(), limit, skip, sort.as_ref())
     }
 
     /// Find documents and return pre-serialized JSON bytes.
@@ -593,7 +594,7 @@ mod tests {
             .unwrap();
 
         let results = db
-            .find("users", json!({"age": {"$gte": 30}}), None, None, None)
+            .find("users", json!({"age": {"$gte": 30}}), None, None, None, None)
             .unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -709,7 +710,7 @@ mod tests {
 
             // Index should be functional after replay
             let results = db
-                .find("users", json!({"age": 30}), None, None, None)
+                .find("users", json!({"age": 30}), None, None, None, None)
                 .unwrap();
             assert_eq!(results.len(), 1);
         }

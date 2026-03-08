@@ -259,8 +259,9 @@ pub fn process_command(db: &Database, request: &Value) -> Value {
             let projection = request.get("projection").cloned();
             let limit = request["limit"].as_u64().map(|n| n as usize);
             let skip = request["skip"].as_u64().map(|n| n as usize);
+            let sort = request.get("sort").cloned();
 
-            match db.find(collection, filter, projection, limit, skip) {
+            match db.find(collection, filter, projection, limit, skip, sort) {
                 Ok(docs) => json!({"ok": true, "documents": docs, "count": docs.len()}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }

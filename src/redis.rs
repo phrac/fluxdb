@@ -388,7 +388,7 @@ fn cmd_keys(db: &Database, collection: &str, args: &[Vec<u8>]) -> RespValue {
     };
 
     // Fetch all docs and extract IDs
-    let docs = match db.find(collection, json!({}), Some(json!({"_id": 1})), None, None) {
+    let docs = match db.find(collection, json!({}), Some(json!({"_id": 1})), None, None, None) {
         Ok(d) => d,
         Err(e) => return RespValue::err(e.to_string()),
     };

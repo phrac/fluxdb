@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::document::Document;
@@ -22,7 +24,8 @@ use crate::error::{FluxError, Result};
 /// - `$gt`, `$gte`, `$lt`, `$lte`: numeric/string comparison
 /// - `$in`, `$nin`: membership in array
 /// - `$exists`: field existence
-/// - `$and`, `$or`, `$not`: logical operators
+/// - `$not`: logical negation (works at both top-level and field-level)
+/// - `$and`, `$or`: logical operators
 pub fn matches_filter(doc: &Document, filter: &Value) -> Result<bool> {
     let filter_obj = filter
         .as_object()
@@ -142,6 +145,11 @@ fn evaluate_operator(doc_value: &Option<&Value>, op: &str, op_value: &Value) -> 
             })?;
             Ok(doc_value.is_some() == should_exist)
         }
+        "$not" => {
+            // Field-level $not: {"age": {"$not": {"$gt": 30}}}
+            // Negates the inner condition against the same field value.
+            Ok(!match_field_condition(doc_value, op_value)?)
+        }
         other => Err(FluxError::InvalidQuery(format!(
             "unknown operator: {other}"
         ))),
@@ -169,6 +177,24 @@ fn compare_values(doc_value: &Option<&Value>, target: &Value) -> Option<std::cmp
         (Value::Number(a), Value::Number(b)) => {
             let fa = a.as_f64()?;
             let fb = b.as_f64()?;
+            fa.partial_cmp(&fb)
+        }
+        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
+/// Compare two JSON values for sort ordering.
+/// Returns None if the values are not comparable.
+pub fn compare_sort_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
+        (Value::Null, _) => Some(std::cmp::Ordering::Less),
+        (_, Value::Null) => Some(std::cmp::Ordering::Greater),
+        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        (Value::Number(na), Value::Number(nb)) => {
+            let fa = na.as_f64()?;
+            let fb = nb.as_f64()?;
             fa.partial_cmp(&fb)
         }
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
@@ -219,13 +245,13 @@ pub fn apply_projection(doc_value: &mut Value, projection: &Value) -> Result<()>
         let include_id = proj_obj.get("_id").and_then(|v| v.as_i64()) != Some(0);
         let id_val = doc_obj.get("_id").cloned();
 
-        let keys_to_keep: Vec<String> = proj_obj
+        let keys_to_keep: HashSet<&str> = proj_obj
             .iter()
             .filter(|(_, v)| v.as_i64() == Some(1))
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.as_str())
             .collect();
 
-        doc_obj.retain(|k, _| keys_to_keep.contains(k));
+        doc_obj.retain(|k, _| keys_to_keep.contains(k.as_str()));
 
         if include_id {
             if let Some(id) = id_val {
@@ -322,6 +348,19 @@ mod tests {
     }
 
     #[test]
+    fn test_field_level_not() {
+        let doc = make_doc(json!({"age": 30}));
+        // {"age": {"$not": {"$gt": 35}}} → age is NOT greater than 35 → true
+        assert!(matches_filter(&doc, &json!({"age": {"$not": {"$gt": 35}}})).unwrap());
+        // {"age": {"$not": {"$gt": 25}}} → age is NOT greater than 25 → false (age=30 > 25)
+        assert!(!matches_filter(&doc, &json!({"age": {"$not": {"$gt": 25}}})).unwrap());
+        // {"age": {"$not": {"$eq": 30}}} → age is NOT equal to 30 → false
+        assert!(!matches_filter(&doc, &json!({"age": {"$not": {"$eq": 30}}})).unwrap());
+        // {"age": {"$not": {"$in": [10, 20]}}} → age NOT in [10,20] → true
+        assert!(matches_filter(&doc, &json!({"age": {"$not": {"$in": [10, 20]}}})).unwrap());
+    }
+
+    #[test]
     fn test_nested_field_query() {
         let doc = make_doc(json!({"address": {"city": "Portland"}}));
         assert!(matches_filter(&doc, &json!({"address.city": "Portland"})).unwrap());
@@ -353,5 +392,17 @@ mod tests {
         let doc = Document::new(json!({"_id": "abc123", "name": "Alice"}));
         assert!(matches_filter(&doc, &json!({"_id": "abc123"})).unwrap());
         assert!(!matches_filter(&doc, &json!({"_id": "wrong"})).unwrap());
+    }
+
+    #[test]
+    fn test_sort_value_comparison() {
+        use std::cmp::Ordering;
+        // Numbers
+        assert_eq!(compare_sort_values(&json!(1), &json!(2)), Some(Ordering::Less));
+        assert_eq!(compare_sort_values(&json!(3.0), &json!(2)), Some(Ordering::Greater));
+        // Strings
+        assert_eq!(compare_sort_values(&json!("a"), &json!("b")), Some(Ordering::Less));
+        // Nulls sort first
+        assert_eq!(compare_sort_values(&json!(null), &json!(1)), Some(Ordering::Less));
     }
 }
