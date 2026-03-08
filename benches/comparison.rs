@@ -463,8 +463,400 @@ mod mongodb_bench {
     }
 }
 
-// ── Benchmark groups ────────────────────────────────────────────────────────
+// ── Grouped benchmarks (overlaid graphs) ─────────────────────────────────────
 
+fn bench_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("insert");
+
+    // FluxDB
+    {
+        let db = fluxdb::database::Database::open_memory();
+        db.create_collection("bench").unwrap();
+        let mut i = 0usize;
+        group.bench_function(BenchmarkId::new("FluxDB", "10K"), |b| {
+            b.iter(|| {
+                let doc_json: serde_json::Value = serde_json::from_str(&make_doc(i)).unwrap();
+                let mut obj = serde_json::Map::new();
+                obj.insert("_id".to_string(), serde_json::Value::String(key(i)));
+                if let serde_json::Value::Object(m) = doc_json {
+                    obj.extend(m);
+                }
+                black_box(db.insert("bench", serde_json::Value::Object(obj)).unwrap());
+                i += 1;
+            })
+        });
+    }
+
+    // SQLite
+    {
+        let dir = tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("bench.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
+        ).unwrap();
+        let mut i = 0usize;
+        group.bench_function(BenchmarkId::new("SQLite", "10K"), |b| {
+            b.iter(|| {
+                conn.execute(
+                    "INSERT OR REPLACE INTO docs (id, data) VALUES (?1, ?2)",
+                    rusqlite::params![key(i), make_doc(i)],
+                ).unwrap();
+                i += 1;
+            })
+        });
+    }
+
+    // RocksDB
+    {
+        let dir = tempdir().unwrap();
+        let db = rocksdb::DB::open_default(dir.path().join("rocks")).unwrap();
+        let mut i = 0usize;
+        group.bench_function(BenchmarkId::new("RocksDB", "10K"), |b| {
+            b.iter(|| {
+                db.put(key(i).as_bytes(), make_doc(i).as_bytes()).unwrap();
+                i += 1;
+            })
+        });
+    }
+
+    // redb
+    {
+        use redb::TableDefinition;
+        const TABLE: TableDefinition<&str, &str> = TableDefinition::new("docs");
+        let dir = tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("redb")).unwrap();
+        let mut i = 0usize;
+        group.bench_function(BenchmarkId::new("redb", "10K"), |b| {
+            b.iter(|| {
+                let k = key(i);
+                let v = make_doc(i);
+                let write_txn = db.begin_write().unwrap();
+                {
+                    let mut table = write_txn.open_table(TABLE).unwrap();
+                    table.insert(k.as_str(), v.as_str()).unwrap();
+                }
+                write_txn.commit().unwrap();
+                i += 1;
+            })
+        });
+    }
+
+    // MongoDB
+    {
+        use mongodb::bson::{doc, Document};
+        use mongodb::sync::Client;
+        if let Ok(client) = Client::with_uri_str("mongodb://127.0.0.1:27017") {
+            if client.database("admin").run_command(doc! { "ping": 1 }).run().is_ok() {
+                let db = client.database("fluxdb_bench");
+                let _ = db.collection::<Document>("bench_insert").drop().run();
+                let col = db.collection::<Document>("bench_insert");
+                let mut i = 0usize;
+                group.bench_function(BenchmarkId::new("MongoDB", "10K"), |b| {
+                    b.iter(|| {
+                        let d = doc! {
+                            "_id": key(i),
+                            "name": format!("user{i}"),
+                            "age": ((i % 80) + 18) as i32,
+                            "email": format!("user{i}@example.com"),
+                            "active": i % 3 != 0,
+                            "tags": ["rust", "database"],
+                        };
+                        black_box(col.insert_one(d).run().unwrap());
+                        i += 1;
+                    })
+                });
+            } else {
+                eprintln!("MongoDB not available, skipping insert benchmark");
+            }
+        }
+    }
+
+    group.finish();
+}
+
+fn bench_get(c: &mut Criterion) {
+    let mut group = c.benchmark_group("get");
+
+    // FluxDB
+    {
+        let db = fluxdb::database::Database::open_memory();
+        db.create_collection("bench").unwrap();
+        for i in 0..DOC_COUNT {
+            let doc_json: serde_json::Value = serde_json::from_str(&make_doc(i)).unwrap();
+            let mut obj = serde_json::Map::new();
+            obj.insert("_id".to_string(), serde_json::Value::String(key(i)));
+            if let serde_json::Value::Object(m) = doc_json {
+                obj.extend(m);
+            }
+            db.insert("bench", serde_json::Value::Object(obj)).unwrap();
+        }
+        let mut i = 0usize;
+        group.bench_function(BenchmarkId::new("FluxDB", "10K"), |b| {
+            b.iter(|| {
+                i = (i + 1) % DOC_COUNT;
+                black_box(db.get("bench", &key(i)).unwrap());
+            })
+        });
+    }
+
+    // SQLite
+    {
+        let dir = tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("bench.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
+        ).unwrap();
+        for i in 0..DOC_COUNT {
+            conn.execute("INSERT INTO docs (id, data) VALUES (?1, ?2)", rusqlite::params![key(i), make_doc(i)]).unwrap();
+        }
+        let mut i = 0usize;
+        group.bench_function(BenchmarkId::new("SQLite", "10K"), |b| {
+            b.iter(|| {
+                i = (i + 1) % DOC_COUNT;
+                let mut stmt = conn.prepare_cached("SELECT data FROM docs WHERE id = ?1").unwrap();
+                let val: String = stmt.query_row([key(i)], |row| row.get(0)).unwrap();
+                black_box(val);
+            })
+        });
+    }
+
+    // RocksDB
+    {
+        let dir = tempdir().unwrap();
+        let db = rocksdb::DB::open_default(dir.path().join("rocks")).unwrap();
+        for i in 0..DOC_COUNT {
+            db.put(key(i).as_bytes(), make_doc(i).as_bytes()).unwrap();
+        }
+        let mut i = 0usize;
+        group.bench_function(BenchmarkId::new("RocksDB", "10K"), |b| {
+            b.iter(|| {
+                i = (i + 1) % DOC_COUNT;
+                black_box(db.get(key(i).as_bytes()).unwrap());
+            })
+        });
+    }
+
+    // redb
+    {
+        use redb::TableDefinition;
+        const TABLE: TableDefinition<&str, &str> = TableDefinition::new("docs");
+        let dir = tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("redb")).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(TABLE).unwrap();
+                for i in 0..DOC_COUNT {
+                    let k = key(i);
+                    let v = make_doc(i);
+                    table.insert(k.as_str(), v.as_str()).unwrap();
+                }
+            }
+            write_txn.commit().unwrap();
+        }
+        let mut i = 0usize;
+        group.bench_function(BenchmarkId::new("redb", "10K"), |b| {
+            b.iter(|| {
+                i = (i + 1) % DOC_COUNT;
+                let k = key(i);
+                let read_txn = db.begin_read().unwrap();
+                let table = read_txn.open_table(TABLE).unwrap();
+                let val = table.get(k.as_str()).unwrap().unwrap();
+                black_box(val.value());
+            })
+        });
+    }
+
+    // MongoDB
+    {
+        use mongodb::bson::{doc, Document};
+        use mongodb::sync::Client;
+        if let Ok(client) = Client::with_uri_str("mongodb://127.0.0.1:27017") {
+            if client.database("admin").run_command(doc! { "ping": 1 }).run().is_ok() {
+                let db = client.database("fluxdb_bench");
+                let _ = db.collection::<Document>("bench_get").drop().run();
+                let col = db.collection::<Document>("bench_get");
+                let docs: Vec<Document> = (0..DOC_COUNT).map(|i| {
+                    doc! {
+                        "_id": key(i),
+                        "name": format!("user{i}"),
+                        "age": ((i % 80) + 18) as i32,
+                        "email": format!("user{i}@example.com"),
+                        "active": i % 3 != 0,
+                        "tags": ["rust", "database"],
+                    }
+                }).collect();
+                col.insert_many(docs).run().unwrap();
+                let mut i = 0usize;
+                group.bench_function(BenchmarkId::new("MongoDB", "10K"), |b| {
+                    b.iter(|| {
+                        i = (i + 1) % DOC_COUNT;
+                        let filter = doc! { "_id": key(i) };
+                        black_box(col.find_one(filter).run().unwrap());
+                    })
+                });
+            } else {
+                eprintln!("MongoDB not available, skipping get benchmark");
+            }
+        }
+    }
+
+    group.finish();
+}
+
+fn bench_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scan_all");
+
+    // FluxDB
+    {
+        let db = fluxdb::database::Database::open_memory();
+        db.create_collection("bench").unwrap();
+        for i in 0..DOC_COUNT {
+            let doc_json: serde_json::Value = serde_json::from_str(&make_doc(i)).unwrap();
+            let mut obj = serde_json::Map::new();
+            obj.insert("_id".to_string(), serde_json::Value::String(key(i)));
+            if let serde_json::Value::Object(m) = doc_json {
+                obj.extend(m);
+            }
+            db.insert("bench", serde_json::Value::Object(obj)).unwrap();
+        }
+        group.bench_function(BenchmarkId::new("FluxDB", "10K"), |b| {
+            b.iter(|| {
+                let mut count = 0;
+                db.scan("bench", |id, bytes| {
+                    black_box((id, bytes));
+                    count += 1;
+                }).unwrap();
+                black_box(count);
+            })
+        });
+    }
+
+    // SQLite
+    {
+        let dir = tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("bench.db")).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             CREATE TABLE IF NOT EXISTS docs (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
+        ).unwrap();
+        for i in 0..DOC_COUNT {
+            conn.execute("INSERT INTO docs (id, data) VALUES (?1, ?2)", rusqlite::params![key(i), make_doc(i)]).unwrap();
+        }
+        group.bench_function(BenchmarkId::new("SQLite", "10K"), |b| {
+            b.iter(|| {
+                let mut stmt = conn.prepare_cached("SELECT id, data FROM docs").unwrap();
+                let rows: Vec<(String, String)> = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+                black_box(rows);
+            })
+        });
+    }
+
+    // RocksDB
+    {
+        let dir = tempdir().unwrap();
+        let db = rocksdb::DB::open_default(dir.path().join("rocks")).unwrap();
+        for i in 0..DOC_COUNT {
+            db.put(key(i).as_bytes(), make_doc(i).as_bytes()).unwrap();
+        }
+        group.bench_function(BenchmarkId::new("RocksDB", "10K"), |b| {
+            b.iter(|| {
+                let mut count = 0;
+                let iter = db.iterator(rocksdb::IteratorMode::Start);
+                for item in iter {
+                    let (k, v) = item.unwrap();
+                    black_box((&k, &v));
+                    count += 1;
+                }
+                black_box(count);
+            })
+        });
+    }
+
+    // redb
+    {
+        use redb::{ReadableTable, TableDefinition};
+        const TABLE: TableDefinition<&str, &str> = TableDefinition::new("docs");
+        let dir = tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("redb")).unwrap();
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(TABLE).unwrap();
+                for i in 0..DOC_COUNT {
+                    let k = key(i);
+                    let v = make_doc(i);
+                    table.insert(k.as_str(), v.as_str()).unwrap();
+                }
+            }
+            write_txn.commit().unwrap();
+        }
+        group.bench_function(BenchmarkId::new("redb", "10K"), |b| {
+            b.iter(|| {
+                let read_txn = db.begin_read().unwrap();
+                let table = read_txn.open_table(TABLE).unwrap();
+                let mut count = 0;
+                for entry in table.iter().unwrap() {
+                    let (k, v) = entry.unwrap();
+                    black_box((k.value(), v.value()));
+                    count += 1;
+                }
+                black_box(count);
+            })
+        });
+    }
+
+    // MongoDB
+    {
+        use mongodb::bson::{doc, Document};
+        use mongodb::sync::Client;
+        if let Ok(client) = Client::with_uri_str("mongodb://127.0.0.1:27017") {
+            if client.database("admin").run_command(doc! { "ping": 1 }).run().is_ok() {
+                let db = client.database("fluxdb_bench");
+                let _ = db.collection::<Document>("bench_scan").drop().run();
+                let col = db.collection::<Document>("bench_scan");
+                let docs: Vec<Document> = (0..DOC_COUNT).map(|i| {
+                    doc! {
+                        "_id": key(i),
+                        "name": format!("user{i}"),
+                        "age": ((i % 80) + 18) as i32,
+                        "email": format!("user{i}@example.com"),
+                        "active": i % 3 != 0,
+                        "tags": ["rust", "database"],
+                    }
+                }).collect();
+                col.insert_many(docs).run().unwrap();
+                group.bench_function(BenchmarkId::new("MongoDB", "10K"), |b| {
+                    b.iter(|| {
+                        let mut count = 0;
+                        let cursor = col.find(doc! {}).run().unwrap();
+                        for result in cursor {
+                            let d: Document = result.unwrap();
+                            black_box(&d);
+                            count += 1;
+                        }
+                        black_box(count);
+                    })
+                });
+            } else {
+                eprintln!("MongoDB not available, skipping scan benchmark");
+            }
+        }
+    }
+
+    group.finish();
+}
+
+// Keep the old individual benchmarks for backward compatibility with `--bench comparison`
 criterion_group!(
     comparison,
     fluxdb_bench::insert,
@@ -483,4 +875,11 @@ criterion_group!(
     mongodb_bench::get,
     mongodb_bench::scan,
 );
-criterion_main!(comparison);
+
+criterion_group!(
+    grouped,
+    bench_insert,
+    bench_get,
+    bench_scan,
+);
+criterion_main!(comparison, grouped);
