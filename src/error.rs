@@ -31,6 +31,12 @@ pub enum FluxError {
 
     #[error("data corruption detected: {0}")]
     CorruptionError(String),
+
+    #[error("node unreachable: {0}")]
+    NodeUnreachable(String),
+
+    #[error("cluster error: {0}")]
+    ClusterError(String),
 }
 
 pub type Result<T> = std::result::Result<T, FluxError>;

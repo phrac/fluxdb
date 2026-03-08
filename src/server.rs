@@ -11,15 +11,31 @@ use crate::database::Database;
 pub struct Server {
     db: Arc<Database>,
     addr: String,
+    #[cfg(feature = "cluster")]
+    router: Option<Arc<crate::cluster::router::ClusterRouter>>,
 }
 
 impl Server {
     /// Create a server from a Config.
     pub fn from_config(config: &Config) -> crate::error::Result<Self> {
         let db = Database::open_with_config(config, None)?;
+        let db = Arc::new(db);
+
+        #[cfg(feature = "cluster")]
+        let router = if config.cluster.enabled {
+            Some(Arc::new(crate::cluster::router::ClusterRouter::new(
+                &config.cluster,
+                Arc::clone(&db),
+            )))
+        } else {
+            None
+        };
+
         Ok(Server {
-            db: Arc::new(db),
+            db,
             addr: config.listen.clone(),
+            #[cfg(feature = "cluster")]
+            router,
         })
     }
 
@@ -28,16 +44,36 @@ impl Server {
         Arc::clone(&self.db)
     }
 
+    /// Start the health checker background task (cluster mode only).
+    #[cfg(feature = "cluster")]
+    pub fn start_health_checker(&self) {
+        if let Some(ref router) = self.router {
+            let checker = crate::cluster::health::HealthChecker::new(router.peers().clone());
+            tokio::spawn(checker.run());
+        }
+    }
+
     pub async fn run(&self) -> crate::error::Result<()> {
         let listener = TcpListener::bind(&self.addr).await?;
         eprintln!("FluxDB listening on {}", self.addr);
+
+        #[cfg(feature = "cluster")]
+        if self.router.is_some() {
+            self.start_health_checker();
+        }
 
         loop {
             let (stream, peer) = listener.accept().await?;
             eprintln!("Client connected: {peer}");
             let db = Arc::clone(&self.db);
+            #[cfg(feature = "cluster")]
+            let router = self.router.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, db).await {
+                #[cfg(feature = "cluster")]
+                let result = handle_client(stream, db, router).await;
+                #[cfg(not(feature = "cluster"))]
+                let result = handle_client(stream, db).await;
+                if let Err(e) = result {
                     eprintln!("Client error: {e}");
                 }
             });
@@ -48,6 +84,7 @@ impl Server {
 async fn handle_client(
     stream: TcpStream,
     db: Arc<Database>,
+    #[cfg(feature = "cluster")] router: Option<Arc<crate::cluster::router::ClusterRouter>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -59,11 +96,45 @@ async fn handle_client(
 
         let response = match serde_json::from_str::<Value>(&line) {
             Ok(request) => {
-                let db = Arc::clone(&db);
-                // Run blocking database operations on a thread pool
-                tokio::task::spawn_blocking(move || process_command(&db, &request))
-                    .await
-                    .unwrap_or_else(|e| json!({"ok": false, "error": format!("internal error: {e}")}))
+                // In cluster mode: route unless the request is already routed to us
+                #[cfg(feature = "cluster")]
+                {
+                    let is_routed = request
+                        .get("_routed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    if !is_routed {
+                        if let Some(ref router) = router {
+                            router.route(&request).await
+                        } else {
+                            let db = Arc::clone(&db);
+                            tokio::task::spawn_blocking(move || process_command(&db, &request))
+                                .await
+                                .unwrap_or_else(|e| {
+                                    json!({"ok": false, "error": format!("internal error: {e}")})
+                                })
+                        }
+                    } else {
+                        // Already routed — execute locally
+                        let db = Arc::clone(&db);
+                        tokio::task::spawn_blocking(move || process_command(&db, &request))
+                            .await
+                            .unwrap_or_else(|e| {
+                                json!({"ok": false, "error": format!("internal error: {e}")})
+                            })
+                    }
+                }
+
+                #[cfg(not(feature = "cluster"))]
+                {
+                    let db = Arc::clone(&db);
+                    tokio::task::spawn_blocking(move || process_command(&db, &request))
+                        .await
+                        .unwrap_or_else(|e| {
+                            json!({"ok": false, "error": format!("internal error: {e}")})
+                        })
+                }
             }
             Err(e) => json!({"ok": false, "error": format!("invalid JSON: {e}")}),
         };
@@ -77,7 +148,7 @@ async fn handle_client(
     Ok(())
 }
 
-fn process_command(db: &Database, request: &Value) -> Value {
+pub fn process_command(db: &Database, request: &Value) -> Value {
     let cmd = match request["cmd"].as_str() {
         Some(c) => c,
         None => return json!({"ok": false, "error": "missing 'cmd' field"}),
@@ -257,6 +328,21 @@ fn process_command(db: &Database, request: &Value) -> Value {
         "stats" => {
             let stats = db.stats();
             json!({"ok": true, "stats": stats})
+        }
+
+        "cluster_status" => {
+            #[cfg(feature = "cluster")]
+            {
+                json!({
+                    "ok": true,
+                    "cluster_enabled": true,
+                    "node": db.name,
+                })
+            }
+            #[cfg(not(feature = "cluster"))]
+            {
+                json!({"ok": true, "cluster_enabled": false})
+            }
         }
 
         other => {

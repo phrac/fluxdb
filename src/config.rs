@@ -51,6 +51,9 @@ pub struct Config {
 
     #[serde(default)]
     pub redis: RedisConfig,
+
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +65,52 @@ pub struct RedisConfig {
     /// Address and port for the Redis protocol server.
     #[serde(default = "default_redis_listen")]
     pub listen: String,
+}
+
+/// Cluster configuration for multi-node deployments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    /// Enable cluster mode.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Unique identifier for this node.
+    #[serde(default)]
+    pub node_id: String,
+
+    /// Address for peer-to-peer communication.
+    #[serde(default = "default_peer_listen")]
+    pub peer_listen: String,
+
+    /// All nodes in the cluster.
+    #[serde(default)]
+    pub nodes: Vec<NodeConfig>,
+}
+
+/// A single node in the cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    /// Unique node identifier.
+    pub id: String,
+    /// Peer-to-peer address (for inter-node communication).
+    pub peer_addr: String,
+    /// Client-facing address (for routing information).
+    pub client_addr: String,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        ClusterConfig {
+            enabled: false,
+            node_id: String::new(),
+            peer_listen: default_peer_listen(),
+            nodes: Vec::new(),
+        }
+    }
+}
+
+fn default_peer_listen() -> String {
+    "127.0.0.1:7655".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +131,7 @@ impl Default for Config {
             listen: default_listen(),
             wal: WalConfig::default(),
             redis: RedisConfig::default(),
+            cluster: ClusterConfig::default(),
         }
     }
 }

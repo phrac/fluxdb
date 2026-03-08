@@ -13,3 +13,5 @@ pub mod config;
 pub mod server;
 #[cfg(feature = "redis")]
 pub mod redis;
+#[cfg(feature = "cluster")]
+pub mod cluster;

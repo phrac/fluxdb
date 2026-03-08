@@ -37,6 +37,16 @@ async fn main() {
         config.wal.batch_size, config.wal.batch_bytes
     );
 
+    #[cfg(feature = "cluster")]
+    if config.cluster.enabled {
+        eprintln!(
+            "Cluster mode:   node={}, {} nodes, peer={}",
+            config.cluster.node_id,
+            config.cluster.nodes.len(),
+            config.cluster.peer_listen
+        );
+    }
+
     let server = match Server::from_config(&config) {
         Ok(s) => s,
         Err(e) => {

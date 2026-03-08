@@ -8,6 +8,7 @@ default = ["server"]
 persistence = []
 server = ["persistence", "dep:tokio", "dep:clap", "dep:toml"]
 redis = ["server"]
+cluster = ["server"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
