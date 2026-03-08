@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::Value;
@@ -8,8 +6,15 @@ use serde_json::Value;
 use crate::collection::Collection;
 use crate::document::Document;
 use crate::error::{FluxError, Result};
-use crate::config::Config;
-use crate::wal::{Wal, WalEntry, WalOperation};
+use crate::storage::{MemoryBackend, StorageBackend};
+use crate::wal::{WalEntry, WalOperation};
+
+#[cfg(feature = "persistence")]
+use std::fs;
+#[cfg(feature = "persistence")]
+use std::path::Path;
+#[cfg(feature = "persistence")]
+use crate::wal::{Wal, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES};
 
 /// The main database engine.
 ///
@@ -18,21 +23,51 @@ use crate::wal::{Wal, WalEntry, WalOperation};
 pub struct Database {
     pub name: String,
     collections: RwLock<HashMap<String, Arc<RwLock<Collection>>>>,
-    wal: Mutex<Wal>,
-    #[allow(dead_code)]
-    data_dir: PathBuf,
+    storage: Mutex<Box<dyn StorageBackend>>,
 }
 
 impl Database {
-    /// Open or create a database with default settings.
-    pub fn open(data_dir: &Path) -> Result<Self> {
-        Self::open_with_config(&Config::default(), Some(data_dir))
+    /// Open a database backed by the given storage engine.
+    ///
+    /// Replays any persisted entries from the backend to rebuild in-memory state.
+    pub fn open_with_storage(name: impl Into<String>, storage: Box<dyn StorageBackend>) -> Result<Self> {
+        let entries = storage.read_all()?;
+        let collections = Self::replay_entries(&entries)?;
+
+        let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
+            .into_iter()
+            .map(|(name, col)| (name, Arc::new(RwLock::new(col))))
+            .collect();
+
+        Ok(Database {
+            name: name.into(),
+            collections: RwLock::new(wrapped),
+            storage: Mutex::new(storage),
+        })
     }
 
-    /// Open or create a database using the provided config.
-    /// If `data_dir_override` is Some, it takes precedence over config.data_dir.
-    pub fn open_with_config(config: &Config, data_dir_override: Option<&Path>) -> Result<Self> {
-        let data_dir = data_dir_override.unwrap_or(&config.data_dir);
+    /// Open an in-memory database with no persistence.
+    pub fn open_memory() -> Self {
+        Database {
+            name: "memory".to_string(),
+            collections: RwLock::new(HashMap::new()),
+            storage: Mutex::new(Box::new(MemoryBackend::new())),
+        }
+    }
+
+    /// Open or create a persistent database at the given path with default settings.
+    #[cfg(feature = "persistence")]
+    pub fn open(data_dir: &Path) -> Result<Self> {
+        Self::open_with_wal(data_dir, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES)
+    }
+
+    /// Open or create a persistent database with custom WAL batch settings.
+    #[cfg(feature = "persistence")]
+    pub fn open_with_wal(
+        data_dir: &Path,
+        wal_batch_size: usize,
+        wal_batch_bytes: usize,
+    ) -> Result<Self> {
         fs::create_dir_all(data_dir)?;
 
         let name = data_dir
@@ -42,17 +77,10 @@ impl Database {
             .to_string();
 
         let wal_path = data_dir.join("wal.log");
-
-        // Read WAL once for both replay and sequence tracking
         let entries = Wal::read_all(&wal_path)?;
         let next_seq = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
         let collections = Self::replay_entries(&entries)?;
-        let wal = Wal::open_at_sequence(
-            &wal_path,
-            next_seq,
-            config.wal.batch_size,
-            config.wal.batch_bytes,
-        )?;
+        let wal = Wal::open_at_sequence(&wal_path, next_seq, wal_batch_size, wal_batch_bytes)?;
 
         let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
             .into_iter()
@@ -62,9 +90,15 @@ impl Database {
         Ok(Database {
             name,
             collections: RwLock::new(wrapped),
-            wal: Mutex::new(wal),
-            data_dir: data_dir.to_path_buf(),
+            storage: Mutex::new(Box::new(wal)),
         })
+    }
+
+    /// Open or create a database using the provided config.
+    #[cfg(feature = "server")]
+    pub fn open_with_config(config: &crate::config::Config, data_dir_override: Option<&Path>) -> Result<Self> {
+        let data_dir = data_dir_override.unwrap_or(&config.data_dir);
+        Self::open_with_wal(data_dir, config.wal.batch_size, config.wal.batch_bytes)
     }
 
     fn replay_entries(entries: &[WalEntry]) -> Result<HashMap<String, Collection>> {
@@ -84,8 +118,7 @@ impl Database {
                     data,
                 } => {
                     if let Some(col) = collections.get_mut(collection) {
-                        let mut doc = Document::new(data.clone());
-                        doc.id = doc_id.clone();
+                        let doc = Document::with_id(doc_id.clone(), data.clone());
                         col.insert(doc);
                     }
                 }
@@ -124,7 +157,7 @@ impl Database {
 
     /// Create a new collection.
     pub fn create_collection(&self, name: &str) -> Result<()> {
-        let mut wal = self.wal.lock().unwrap();
+        let mut wal = self.storage.lock().unwrap();
         let mut collections = self.collections.write().unwrap();
 
         if collections.contains_key(name) {
@@ -144,7 +177,7 @@ impl Database {
 
     /// Drop a collection and all its documents.
     pub fn drop_collection(&self, name: &str) -> Result<()> {
-        let mut wal = self.wal.lock().unwrap();
+        let mut wal = self.storage.lock().unwrap();
         let mut collections = self.collections.write().unwrap();
 
         if !collections.contains_key(name) {
@@ -178,15 +211,17 @@ impl Database {
 
         let doc = Document::new(value);
         let id = doc.id.clone();
-        let data = doc.data.clone();
+        // Store data WITHOUT _id in WAL — the doc_id field carries it separately.
+        // This avoids redundant storage and matches the update path.
+        let wal_data = doc.data_without_id();
 
         // WAL first
         {
-            let mut wal = self.wal.lock().unwrap();
+            let mut wal = self.storage.lock().unwrap();
             wal.append(WalOperation::Insert {
                 collection: collection.to_string(),
                 doc_id: id.clone(),
-                data,
+                data: wal_data,
             })?;
         }
 
@@ -235,7 +270,7 @@ impl Database {
         };
 
         {
-            let mut wal = self.wal.lock().unwrap();
+            let mut wal = self.storage.lock().unwrap();
             wal.append(WalOperation::Update {
                 collection: collection.to_string(),
                 doc_id: id.to_string(),
@@ -268,7 +303,7 @@ impl Database {
         }
 
         {
-            let mut wal = self.wal.lock().unwrap();
+            let mut wal = self.storage.lock().unwrap();
             wal.append(WalOperation::Delete {
                 collection: collection.to_string(),
                 doc_id: id.to_string(),
@@ -297,6 +332,41 @@ impl Database {
         col.find(&filter, projection.as_ref(), limit, skip)
     }
 
+    /// Find documents and return pre-serialized JSON bytes.
+    /// Much faster than `find()` for bulk reads—avoids cloning Value trees.
+    pub fn find_raw(
+        &self,
+        collection: &str,
+        filter: Value,
+        limit: Option<usize>,
+        skip: Option<usize>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let collections = self.collections.read().unwrap();
+        let col_arc = collections
+            .get(collection)
+            .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?;
+
+        let col = col_arc.read().unwrap();
+        let slices = col.find_raw(&filter, limit, skip)?;
+        Ok(slices.into_iter().map(|s| s.to_vec()).collect())
+    }
+
+    /// Zero-copy iterate over all documents in a collection.
+    /// Calls `f(id, raw_json_bytes)` for each document. No allocations.
+    pub fn scan<F>(&self, collection: &str, f: F) -> Result<()>
+    where
+        F: FnMut(&str, &[u8]),
+    {
+        let collections = self.collections.read().unwrap();
+        let col_arc = collections
+            .get(collection)
+            .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?;
+
+        let col = col_arc.read().unwrap();
+        col.scan(f);
+        Ok(())
+    }
+
     /// Count documents matching a filter.
     pub fn count(&self, collection: &str, filter: Value) -> Result<usize> {
         let collections = self.collections.read().unwrap();
@@ -319,7 +389,7 @@ impl Database {
         };
 
         {
-            let mut wal = self.wal.lock().unwrap();
+            let mut wal = self.storage.lock().unwrap();
             wal.append(WalOperation::CreateIndex {
                 collection: collection.to_string(),
                 field: field.to_string(),
@@ -341,7 +411,7 @@ impl Database {
         };
 
         {
-            let mut wal = self.wal.lock().unwrap();
+            let mut wal = self.storage.lock().unwrap();
             wal.append(WalOperation::DropIndex {
                 collection: collection.to_string(),
                 field: field.to_string(),
@@ -364,37 +434,43 @@ impl Database {
     }
 
     /// Compact the WAL by writing a fresh snapshot of current state.
+    ///
+    /// Uses atomic replacement (temp file + rename) so a crash at any point
+    /// leaves either the old or new WAL intact — never a partial file.
     pub fn compact(&self) -> Result<()> {
-        let mut wal = self.wal.lock().unwrap();
+        let mut wal = self.storage.lock().unwrap();
         wal.flush()?;
-        wal.truncate()?;
 
+        // Build the complete set of operations representing current state
         let collections = self.collections.read().unwrap();
+        let mut ops = Vec::new();
+
         for (name, col_arc) in collections.iter() {
-            wal.append(WalOperation::CreateCollection {
+            ops.push(WalOperation::CreateCollection {
                 name: name.clone(),
-            })?;
+            });
 
             let col = col_arc.read().unwrap();
             for doc_id in col.doc_ids() {
                 if let Ok(doc) = col.get(&doc_id) {
-                    wal.append(WalOperation::Insert {
+                    ops.push(WalOperation::Insert {
                         collection: name.clone(),
                         doc_id: doc.id.clone(),
-                        data: doc.data.clone(),
-                    })?;
+                        data: doc.data_without_id(),
+                    });
                 }
             }
 
             for field in col.list_indexes() {
-                wal.append(WalOperation::CreateIndex {
+                ops.push(WalOperation::CreateIndex {
                     collection: name.clone(),
                     field,
-                })?;
+                });
             }
         }
 
-        wal.flush()?;
+        // Atomically replace the WAL (crash-safe for persistent backends)
+        wal.replace_all(ops)?;
         Ok(())
     }
 
@@ -429,7 +505,7 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        if let Ok(mut wal) = self.wal.lock() {
+        if let Ok(mut wal) = self.storage.lock() {
             let _ = wal.flush();
         }
     }
@@ -637,6 +713,55 @@ mod tests {
                 .unwrap();
             assert_eq!(results.len(), 1);
         }
+    }
+
+    #[test]
+    fn test_compact_preserves_data_on_reopen() {
+        let dir = tempdir().unwrap();
+
+        {
+            let db = Database::open(dir.path()).unwrap();
+            db.create_collection("users").unwrap();
+            db.insert("users", json!({"_id": "1", "name": "Alice"})).unwrap();
+            db.insert("users", json!({"_id": "2", "name": "Bob"})).unwrap();
+            db.insert("users", json!({"_id": "3", "name": "Charlie"})).unwrap();
+            db.delete("users", "2").unwrap();
+            db.update("users", "1", json!({"name": "Alice Updated"})).unwrap();
+            db.create_index("users", "name").unwrap();
+
+            // Compact should atomically rewrite the WAL
+            db.compact().unwrap();
+        }
+
+        // Reopen and verify everything survived
+        {
+            let db = Database::open(dir.path()).unwrap();
+            let doc = db.get("users", "1").unwrap();
+            assert_eq!(doc["name"], "Alice Updated");
+
+            assert!(db.get("users", "2").is_err()); // was deleted
+
+            let doc = db.get("users", "3").unwrap();
+            assert_eq!(doc["name"], "Charlie");
+
+            assert_eq!(db.count("users", json!({})).unwrap(), 2);
+
+            let indexes = db.list_indexes("users").unwrap();
+            assert_eq!(indexes, vec!["name"]);
+        }
+    }
+
+    #[test]
+    fn test_no_temp_file_after_compact() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        db.create_collection("test").unwrap();
+        db.insert("test", json!({"_id": "1", "x": 1})).unwrap();
+        db.compact().unwrap();
+
+        // Verify no .wal.tmp file left behind
+        let tmp_path = dir.path().join("wal.wal.tmp");
+        assert!(!tmp_path.exists());
     }
 
     #[test]

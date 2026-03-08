@@ -28,6 +28,10 @@ pub struct Cli {
     #[arg(long)]
     pub wal_batch_bytes: Option<usize>,
 
+    /// Enable Redis-compatible protocol server
+    #[arg(long)]
+    pub redis: Option<Option<String>>,
+
     /// Generate a default config file and exit
     #[arg(long)]
     pub init_config: Option<PathBuf>,
@@ -44,6 +48,20 @@ pub struct Config {
 
     #[serde(default)]
     pub wal: WalConfig,
+
+    #[serde(default)]
+    pub redis: RedisConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisConfig {
+    /// Enable the Redis-compatible protocol server.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Address and port for the Redis protocol server.
+    #[serde(default = "default_redis_listen")]
+    pub listen: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +81,16 @@ impl Default for Config {
             data_dir: default_data_dir(),
             listen: default_listen(),
             wal: WalConfig::default(),
+            redis: RedisConfig::default(),
+        }
+    }
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        RedisConfig {
+            enabled: false,
+            listen: default_redis_listen(),
         }
     }
 }
@@ -90,6 +118,10 @@ fn default_wal_batch_size() -> usize {
 
 fn default_wal_batch_bytes() -> usize {
     64 * 1024
+}
+
+fn default_redis_listen() -> String {
+    "127.0.0.1:6379".to_string()
 }
 
 impl Config {
@@ -125,6 +157,12 @@ impl Config {
         if let Some(bytes) = cli.wal_batch_bytes {
             config.wal.batch_bytes = bytes;
         }
+        if let Some(ref redis_opt) = cli.redis {
+            config.redis.enabled = true;
+            if let Some(addr) = redis_opt {
+                config.redis.listen = addr.clone();
+            }
+        }
 
         Ok(config)
     }
@@ -158,8 +196,19 @@ impl Config {
         ));
         out.push_str(&format!(
             "# Byte threshold for the WAL write buffer before flushing.\n\
-             batch_bytes = {}\n",
+             batch_bytes = {}\n\n",
             self.wal.batch_bytes
+        ));
+        out.push_str("[redis]\n");
+        out.push_str(&format!(
+            "# Enable Redis-compatible protocol server.\n\
+             enabled = {}\n\n",
+            self.redis.enabled
+        ));
+        out.push_str(&format!(
+            "# Address and port for the Redis protocol server.\n\
+             listen = {:?}\n",
+            self.redis.listen
         ));
         out
     }

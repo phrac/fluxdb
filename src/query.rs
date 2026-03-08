@@ -28,6 +28,10 @@ pub fn matches_filter(doc: &Document, filter: &Value) -> Result<bool> {
         .as_object()
         .ok_or_else(|| FluxError::InvalidQuery("filter must be a JSON object".into()))?;
 
+    if filter_obj.is_empty() {
+        return Ok(true);
+    }
+
     for (key, condition) in filter_obj {
         match key.as_str() {
             "$and" => {
@@ -61,19 +65,8 @@ pub fn matches_filter(doc: &Document, filter: &Value) -> Result<bool> {
                 }
             }
             field => {
-                let doc_value = if field == "_id" {
-                    Some(&Value::String(doc.id.clone()))
-                } else {
-                    doc.get_field(field)
-                };
-
-                // Handle _id comparison specially since we create a temporary value
-                if field == "_id" {
-                    let id_value = Value::String(doc.id.clone());
-                    if !match_field_condition(&Some(&id_value), condition)? {
-                        return Ok(false);
-                    }
-                } else if !match_field_condition(&doc_value, condition)? {
+                let doc_value = doc.get_field(field);
+                if !match_field_condition(&doc_value, condition)? {
                     return Ok(false);
                 }
             }

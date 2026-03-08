@@ -23,6 +23,11 @@ impl Server {
         })
     }
 
+    /// Get a shared reference to the underlying database.
+    pub fn db(&self) -> Arc<Database> {
+        Arc::clone(&self.db)
+    }
+
     pub async fn run(&self) -> crate::error::Result<()> {
         let listener = TcpListener::bind(&self.addr).await?;
         eprintln!("FluxDB listening on {}", self.addr);

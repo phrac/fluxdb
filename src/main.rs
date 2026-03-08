@@ -45,6 +45,20 @@ async fn main() {
         }
     };
 
+    // Optionally start the Redis-compatible protocol server
+    #[cfg(feature = "redis")]
+    if config.redis.enabled {
+        let redis_addr = config.redis.listen.clone();
+        let db = server.db();
+        eprintln!("Redis protocol: {}", redis_addr);
+        tokio::spawn(async move {
+            let redis_server = fluxdb::redis::RedisServer::new(db, redis_addr);
+            if let Err(e) = redis_server.run().await {
+                eprintln!("Redis server error: {e}");
+            }
+        });
+    }
+
     if let Err(e) = server.run().await {
         eprintln!("Server error: {e}");
         std::process::exit(1);

@@ -1,16 +1,24 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "persistence")]
 use crate::error::{FluxError, Result};
+
+#[cfg(feature = "persistence")]
+use std::fs::{self, File, OpenOptions};
+#[cfg(feature = "persistence")]
+use std::io::Write;
+#[cfg(feature = "persistence")]
+use std::path::{Path, PathBuf};
+
+#[cfg(feature = "persistence")]
+use crate::storage::StorageBackend;
 
 pub const DEFAULT_BATCH_SIZE: usize = 64;
 pub const DEFAULT_BATCH_BYTES: usize = 64 * 1024;
 
 /// A WAL entry representing a single mutation.
+#[derive(Clone)]
 pub struct WalEntry {
     pub sequence: u64,
     pub operation: WalOperation,
@@ -51,6 +59,7 @@ pub enum WalOperation {
 }
 
 /// Bincode-friendly representation where Value fields are pre-serialized as JSON bytes.
+#[cfg(feature = "persistence")]
 #[derive(Serialize, Deserialize)]
 enum BinWalOp {
     CreateCollection { name: String },
@@ -62,6 +71,7 @@ enum BinWalOp {
     DropIndex { collection: String, field: String },
 }
 
+#[cfg(feature = "persistence")]
 impl BinWalOp {
     fn from_op(op: &WalOperation) -> std::result::Result<Self, FluxError> {
         Ok(match op {
@@ -135,6 +145,7 @@ impl BinWalOp {
 ///   [8 bytes: sequence (u64 LE)]
 ///   [N bytes: bincode-serialized BinWalOp]
 ///   [4 bytes: CRC32 (u32 LE)] — over seq + op_data
+#[cfg(feature = "persistence")]
 pub struct Wal {
     path: PathBuf,
     file: File,
@@ -145,6 +156,7 @@ pub struct Wal {
     batch_bytes: usize,
 }
 
+#[cfg(feature = "persistence")]
 impl Wal {
     /// Open or create a WAL file with default batch settings.
     pub fn open(path: &Path) -> Result<Self> {
@@ -267,7 +279,7 @@ impl Wal {
                 u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
 
             if payload_len < 12 || pos + 4 + payload_len > data.len() {
-                // Partial write or too small — stop here
+                // Partial write or too small — stop here (truncated tail)
                 break;
             }
 
@@ -282,14 +294,24 @@ impl Wal {
 
             let computed_crc = crc32fast::hash(&entry_data[0..payload_len - 4]);
             if computed_crc != stored_crc {
-                return Err(FluxError::CorruptionError(format!(
-                    "checksum mismatch at sequence {seq}: expected {computed_crc}, got {stored_crc}"
-                )));
+                // Corruption detected — stop here, recover everything before this point.
+                // This handles torn writes / partial flushes gracefully.
+                eprintln!(
+                    "fluxdb: WAL checksum mismatch at sequence {seq}, \
+                     recovering {} valid entries before corruption",
+                    entries.len()
+                );
+                break;
             }
 
-            let bin_op: BinWalOp = bincode::deserialize(op_bytes)
-                .map_err(|e| FluxError::StorageError(format!("bincode decode: {e}")))?;
-            let operation = bin_op.into_op()?;
+            let bin_op: BinWalOp = match bincode::deserialize(op_bytes) {
+                Ok(op) => op,
+                Err(_) => break, // corrupted entry payload — stop here
+            };
+            let operation = match bin_op.into_op() {
+                Ok(op) => op,
+                Err(_) => break, // corrupted JSON data — stop here
+            };
 
             entries.push(WalEntry {
                 sequence: seq,
@@ -302,14 +324,44 @@ impl Wal {
     }
 
     /// Read legacy JSON-per-line WAL format (backward compatibility).
+    ///
+    /// Uses a dedicated `LegacyWalOp` enum because the main `WalOperation` has
+    /// `#[serde(skip)]` on data fields (needed for the binary path), which would
+    /// silently drop document data during JSON deserialization.
     fn read_all_json(data: &[u8]) -> Result<Vec<WalEntry>> {
         let text = std::str::from_utf8(data)
             .map_err(|e| FluxError::StorageError(format!("invalid UTF-8 in WAL: {e}")))?;
 
+        /// Enum without `#[serde(skip)]` so JSON data fields are deserialized correctly.
+        #[derive(Serialize, Deserialize)]
+        enum LegacyWalOp {
+            CreateCollection { name: String },
+            DropCollection { name: String },
+            Insert { collection: String, doc_id: String, data: Value },
+            Update { collection: String, doc_id: String, data: Value },
+            Delete { collection: String, doc_id: String },
+            CreateIndex { collection: String, field: String },
+            DropIndex { collection: String, field: String },
+        }
+
+        impl LegacyWalOp {
+            fn into_wal_op(self) -> WalOperation {
+                match self {
+                    LegacyWalOp::CreateCollection { name } => WalOperation::CreateCollection { name },
+                    LegacyWalOp::DropCollection { name } => WalOperation::DropCollection { name },
+                    LegacyWalOp::Insert { collection, doc_id, data } => WalOperation::Insert { collection, doc_id, data },
+                    LegacyWalOp::Update { collection, doc_id, data } => WalOperation::Update { collection, doc_id, data },
+                    LegacyWalOp::Delete { collection, doc_id } => WalOperation::Delete { collection, doc_id },
+                    LegacyWalOp::CreateIndex { collection, field } => WalOperation::CreateIndex { collection, field },
+                    LegacyWalOp::DropIndex { collection, field } => WalOperation::DropIndex { collection, field },
+                }
+            }
+        }
+
         #[derive(Deserialize)]
         struct LegacyEntry {
             sequence: u64,
-            operation: WalOperation,
+            operation: LegacyWalOp,
             checksum: u32,
         }
 
@@ -324,14 +376,18 @@ impl Wal {
                         .map_err(|e| FluxError::StorageError(e.to_string()))?;
                     let expected = crc32fast::hash(&op_bytes);
                     if expected != entry.checksum {
-                        return Err(FluxError::CorruptionError(format!(
-                            "checksum mismatch at sequence {}",
-                            entry.sequence
-                        )));
+                        // Corruption — stop here, recover what we have
+                        eprintln!(
+                            "fluxdb: legacy WAL checksum mismatch at sequence {}, \
+                             recovering {} valid entries",
+                            entry.sequence,
+                            entries.len()
+                        );
+                        break;
                     }
                     entries.push(WalEntry {
                         sequence: entry.sequence,
-                        operation: entry.operation,
+                        operation: entry.operation.into_wal_op(),
                     });
                 }
                 Err(_) => break,
@@ -353,11 +409,98 @@ impl Wal {
         self.sequence = 0;
         Ok(())
     }
+
+    /// Atomically replace the WAL with a new set of operations.
+    ///
+    /// Writes to a temporary file, fsyncs it, then renames over the original.
+    /// `rename()` is atomic on POSIX filesystems, so a crash at any point
+    /// leaves either the old or new WAL intact — never a half-written file.
+    fn atomic_replace(&mut self, ops: Vec<WalOperation>) -> Result<()> {
+        let tmp_path = self.path.with_extension("wal.tmp");
+
+        // Build the new WAL contents in memory, then write in one shot
+        let mut buf = Vec::new();
+        let mut seq = 0u64;
+        for op in &ops {
+            let bin_op = BinWalOp::from_op(op)?;
+            let op_bytes = bincode::serialize(&bin_op)
+                .map_err(|e| FluxError::StorageError(format!("bincode serialize: {e}")))?;
+
+            let payload_len = (8 + op_bytes.len() + 4) as u32;
+            buf.reserve(4 + payload_len as usize);
+
+            let crc_start = buf.len() + 4; // position of seq (start of CRC'd region)
+            buf.extend_from_slice(&payload_len.to_le_bytes());
+            buf.extend_from_slice(&seq.to_le_bytes());
+            buf.extend_from_slice(&op_bytes);
+
+            let crc = crc32fast::hash(&buf[crc_start..]);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            seq += 1;
+        }
+
+        // Write temp file and fsync
+        {
+            let mut tmp_file = File::create(&tmp_path)?;
+            tmp_file.write_all(&buf)?;
+            tmp_file.sync_all()?;
+        }
+
+        // Atomic rename: old WAL → new WAL
+        fs::rename(&tmp_path, &self.path)?;
+
+        // fsync the directory so the rename is durable
+        Self::fsync_dir(&self.path)?;
+
+        // Reopen the file handle for future appends
+        self.file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)?;
+        self.sequence = seq;
+        self.buffer.clear();
+        self.pending_count = 0;
+
+        Ok(())
+    }
+
+    /// fsync the parent directory to ensure file metadata (create/rename) is durable.
+    fn fsync_dir(file_path: &Path) -> Result<()> {
+        if let Some(parent) = file_path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "persistence")]
+impl StorageBackend for Wal {
+    fn append(&mut self, op: WalOperation) -> Result<u64> {
+        Wal::append(self, op)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Wal::flush(self)
+    }
+
+    fn read_all(&self) -> Result<Vec<WalEntry>> {
+        Wal::read_all(&self.path)
+    }
+
+    fn truncate(&mut self) -> Result<()> {
+        Wal::truncate(self)
+    }
+
+    /// Crash-safe compaction: writes to temp file, fsyncs, renames atomically.
+    fn replace_all(&mut self, ops: Vec<WalOperation>) -> Result<()> {
+        self.atomic_replace(ops)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StorageBackend;
     use tempfile::tempdir;
 
     #[test]
@@ -478,5 +621,199 @@ mod tests {
 
         let entries = Wal::read_all(&wal_path).unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_wal_recovers_before_corruption() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        // Write 3 valid entries
+        {
+            let mut wal = Wal::open(&wal_path).unwrap();
+            wal.append(WalOperation::CreateCollection { name: "users".into() }).unwrap();
+            wal.append(WalOperation::Insert {
+                collection: "users".into(),
+                doc_id: "1".into(),
+                data: serde_json::json!({"name": "Alice"}),
+            }).unwrap();
+            wal.append(WalOperation::Insert {
+                collection: "users".into(),
+                doc_id: "2".into(),
+                data: serde_json::json!({"name": "Bob"}),
+            }).unwrap();
+            wal.flush().unwrap();
+        }
+
+        // Append garbage bytes to simulate a torn write / corruption
+        {
+            let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            // Write a valid-looking length header but corrupt payload
+            file.write_all(&100u32.to_le_bytes()).unwrap();
+            file.write_all(b"CORRUPT_GARBAGE_DATA_HERE!!").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        // Should recover the 3 valid entries, not error
+        let entries = Wal::read_all(&wal_path).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[2].sequence, 2);
+    }
+
+    #[test]
+    fn test_wal_recovers_from_crc_mismatch() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        // Write 2 valid entries
+        {
+            let mut wal = Wal::open(&wal_path).unwrap();
+            wal.append(WalOperation::CreateCollection { name: "a".into() }).unwrap();
+            wal.append(WalOperation::CreateCollection { name: "b".into() }).unwrap();
+            wal.flush().unwrap();
+        }
+
+        // Read the file and corrupt the CRC of the second entry
+        let mut data = fs::read(&wal_path).unwrap();
+        // Find the second entry — skip past first entry
+        let first_payload_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let second_entry_start = 4 + first_payload_len;
+        let second_payload_len = u32::from_le_bytes(
+            data[second_entry_start..second_entry_start + 4].try_into().unwrap()
+        ) as usize;
+        // Corrupt the CRC (last 4 bytes of second entry's payload)
+        let crc_pos = second_entry_start + 4 + second_payload_len - 4;
+        data[crc_pos] ^= 0xFF;
+        fs::write(&wal_path, &data).unwrap();
+
+        // Should recover only the first entry
+        let entries = Wal::read_all(&wal_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 0);
+    }
+
+    #[test]
+    fn test_wal_truncated_tail_recovery() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        // Write entries
+        {
+            let mut wal = Wal::open(&wal_path).unwrap();
+            wal.append(WalOperation::CreateCollection { name: "users".into() }).unwrap();
+            wal.append(WalOperation::Insert {
+                collection: "users".into(),
+                doc_id: "1".into(),
+                data: serde_json::json!({"x": 1}),
+            }).unwrap();
+            wal.flush().unwrap();
+        }
+
+        // Truncate the file mid-entry (simulate crash during write)
+        let data = fs::read(&wal_path).unwrap();
+        let truncated = &data[..data.len() - 5]; // chop off last 5 bytes
+        fs::write(&wal_path, truncated).unwrap();
+
+        // Should recover the first entry only
+        let entries = Wal::read_all(&wal_path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 0);
+    }
+
+    #[test]
+    fn test_wal_atomic_replace() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        let mut wal = Wal::open(&wal_path).unwrap();
+
+        // Write initial entries
+        wal.append(WalOperation::CreateCollection { name: "a".into() }).unwrap();
+        wal.append(WalOperation::CreateCollection { name: "b".into() }).unwrap();
+        wal.append(WalOperation::Insert {
+            collection: "a".into(),
+            doc_id: "1".into(),
+            data: serde_json::json!({"old": true}),
+        }).unwrap();
+        wal.flush().unwrap();
+
+        // Atomic replace with compacted state
+        let new_ops = vec![
+            WalOperation::CreateCollection { name: "a".into() },
+            WalOperation::Insert {
+                collection: "a".into(),
+                doc_id: "1".into(),
+                data: serde_json::json!({"compacted": true}),
+            },
+        ];
+        wal.replace_all(new_ops).unwrap();
+
+        // Verify the WAL now has only the compacted entries
+        let entries = Wal::read_all(&wal_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[1].sequence, 1);
+
+        // Verify no temp file left behind
+        assert!(!wal_path.with_extension("wal.tmp").exists());
+
+        // Verify we can still append after replace
+        wal.append(WalOperation::CreateCollection { name: "c".into() }).unwrap();
+        wal.flush().unwrap();
+
+        let entries = Wal::read_all(&wal_path).unwrap();
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn test_wal_legacy_json_format() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        // The legacy format: each line is {"sequence":N,"operation":{...},"checksum":CRC}
+        // Checksum was CRC32 of serde_json::to_vec(&WalOperation), which serializes
+        // struct variant fields in *declaration order* (not alphabetical).
+        // We replicate that by using a matching struct for serialization.
+
+        #[derive(serde::Serialize)]
+        enum TestOp {
+            CreateCollection { name: String },
+            Insert { collection: String, doc_id: String, data: serde_json::Value },
+        }
+
+        let op1 = TestOp::CreateCollection { name: "users".into() };
+        let op1_bytes = serde_json::to_vec(&op1).unwrap();
+        let crc1 = crc32fast::hash(&op1_bytes);
+        let op1_val: serde_json::Value = serde_json::from_slice(&op1_bytes).unwrap();
+
+        let op2 = TestOp::Insert {
+            collection: "users".into(),
+            doc_id: "1".into(),
+            data: serde_json::json!({"name": "Alice"}),
+        };
+        let op2_bytes = serde_json::to_vec(&op2).unwrap();
+        let crc2 = crc32fast::hash(&op2_bytes);
+        let op2_val: serde_json::Value = serde_json::from_slice(&op2_bytes).unwrap();
+
+        let line1 = serde_json::json!({"sequence": 0, "operation": op1_val, "checksum": crc1});
+        let line2 = serde_json::json!({"sequence": 1, "operation": op2_val, "checksum": crc2});
+
+        let content = format!("{}\n{}\n", line1, line2);
+        fs::write(&wal_path, content).unwrap();
+
+        // Should read both entries with data intact
+        let entries = Wal::read_all(&wal_path).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Verify the Insert operation has its data
+        match &entries[1].operation {
+            WalOperation::Insert { collection, doc_id, data } => {
+                assert_eq!(collection, "users");
+                assert_eq!(doc_id, "1");
+                assert_eq!(data["name"], "Alice");
+            }
+            other => panic!("expected Insert, got {:?}", other),
+        }
     }
 }

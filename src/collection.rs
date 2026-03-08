@@ -59,8 +59,8 @@ impl Collection {
             }
         }
 
-        // Update data
-        documents.get_mut(id).unwrap().data = data;
+        // Update data (rebuilds raw byte cache, preserves _id)
+        documents.get_mut(id).unwrap().set_data(data);
 
         // Add new index entries
         {
@@ -102,11 +102,30 @@ impl Collection {
         limit: Option<usize>,
         skip: Option<usize>,
     ) -> Result<Vec<Value>> {
-        let mut results = Vec::new();
+        let is_match_all = filter.as_object().map_or(false, |m| m.is_empty());
+        let has_projection = projection
+            .and_then(|p| p.as_object())
+            .map_or(false, |o| !o.is_empty());
+
+        // Ultra-fast path: full scan, no filter, no projection, no skip/limit
+        if is_match_all && !has_projection && skip.is_none() && limit.is_none() {
+            let mut results = Vec::with_capacity(self.documents.len());
+            for doc in self.documents.values() {
+                results.push(doc.to_value());
+            }
+            return Ok(results);
+        }
+
+        let capacity = if is_match_all { self.documents.len() } else { 16 };
+        let mut results = Vec::with_capacity(capacity);
         let skip_count = skip.unwrap_or(0);
         let mut skipped = 0;
 
-        let candidate_ids = self.try_index_scan(filter);
+        let candidate_ids = if is_match_all {
+            None
+        } else {
+            self.try_index_scan(filter)
+        };
 
         let iter: Box<dyn Iterator<Item = &Document>> = match &candidate_ids {
             Some(ids) => Box::new(ids.iter().filter_map(|id| self.documents.get(id))),
@@ -114,15 +133,15 @@ impl Collection {
         };
 
         for doc in iter {
-            if matches_filter(doc, filter)? {
+            if is_match_all || matches_filter(doc, filter)? {
                 if skipped < skip_count {
                     skipped += 1;
                     continue;
                 }
 
                 let mut val = doc.to_value();
-                if let Some(proj) = projection {
-                    apply_projection(&mut val, proj)?;
+                if has_projection {
+                    apply_projection(&mut val, projection.unwrap())?;
                 }
                 results.push(val);
 
@@ -137,8 +156,68 @@ impl Collection {
         Ok(results)
     }
 
+    /// Find documents and return pre-serialized JSON bytes for each match.
+    /// Much faster than `find()` for bulk reads since it avoids cloning Value trees.
+    pub fn find_raw(
+        &self,
+        filter: &Value,
+        limit: Option<usize>,
+        skip: Option<usize>,
+    ) -> Result<Vec<&[u8]>> {
+        let is_match_all = filter.as_object().map_or(false, |m| m.is_empty());
+
+        // Ultra-fast path: return all raw byte slices
+        if is_match_all && skip.is_none() && limit.is_none() {
+            let mut results = Vec::with_capacity(self.documents.len());
+            for doc in self.documents.values() {
+                results.push(doc.raw_bytes());
+            }
+            return Ok(results);
+        }
+
+        let capacity = if is_match_all { self.documents.len() } else { 16 };
+        let mut results = Vec::with_capacity(capacity);
+        let skip_count = skip.unwrap_or(0);
+        let mut skipped = 0;
+
+        let candidate_ids = if is_match_all {
+            None
+        } else {
+            self.try_index_scan(filter)
+        };
+
+        let iter: Box<dyn Iterator<Item = &Document>> = match &candidate_ids {
+            Some(ids) => Box::new(ids.iter().filter_map(|id| self.documents.get(id))),
+            None => Box::new(self.documents.values()),
+        };
+
+        for doc in iter {
+            if is_match_all || matches_filter(doc, filter)? {
+                if skipped < skip_count {
+                    skipped += 1;
+                    continue;
+                }
+
+                results.push(doc.raw_bytes());
+
+                if let Some(lim) = limit {
+                    if results.len() >= lim {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Count documents matching a filter.
     pub fn count(&self, filter: &Value) -> Result<usize> {
+        let is_match_all = filter.as_object().map_or(false, |m| m.is_empty());
+        if is_match_all {
+            return Ok(self.documents.len());
+        }
+
         let candidate_ids = self.try_index_scan(filter);
 
         let iter: Box<dyn Iterator<Item = &Document>> = match &candidate_ids {
@@ -153,6 +232,17 @@ impl Collection {
             }
         }
         Ok(count)
+    }
+
+    /// Zero-copy iterate over all documents, calling the callback with each
+    /// document's ID and pre-serialized JSON bytes. No allocations.
+    pub fn scan<F>(&self, mut f: F)
+    where
+        F: FnMut(&str, &[u8]),
+    {
+        for doc in self.documents.values() {
+            f(&doc.id, doc.raw_bytes());
+        }
     }
 
     /// Return total number of documents.
