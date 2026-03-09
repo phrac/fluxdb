@@ -768,44 +768,48 @@ impl Database {
     /// Uses atomic replacement (temp file + rename) so a crash at any point
     /// leaves either the old or new WAL intact — never a partial file.
     ///
-    /// Minimizes lock contention: reads collections snapshot first, then
-    /// acquires WAL lock only for the atomic replace.
+    /// Holds the collections WRITE lock for the entire operation to prevent
+    /// concurrent mutations from writing WAL entries that replace_all would
+    /// destroy. Compaction is rare (hourly by default) so the brief block
+    /// is acceptable.
     pub fn compact(&self) -> Result<()> {
         // First, flush any pending WAL entries
         self.wal.flush()?;
 
-        // Build the ops snapshot while only holding read locks (no WAL lock)
-        let ops = {
-            let collections = read_collections(&self.collections)?;
-            let mut ops = Vec::new();
+        // Hold write lock for the entire snapshot + replace to prevent
+        // concurrent mutations from writing WAL entries between the
+        // snapshot read and the atomic replace. Without this, a
+        // create_collection or insert could append to the WAL after
+        // the snapshot is built, and replace_all would destroy that entry.
+        let collections = write_collections(&self.collections)?;
+        let mut ops = Vec::new();
 
-            for (name, col_arc) in collections.iter() {
-                ops.push(WalOperation::CreateCollection {
-                    name: name.clone(),
-                });
+        for (name, col_arc) in collections.iter() {
+            ops.push(WalOperation::CreateCollection {
+                name: name.clone(),
+            });
 
-                let col = read_collection(col_arc)?;
-                for doc_id in col.doc_ids() {
-                    if let Ok(doc) = col.get(&doc_id) {
-                        ops.push(WalOperation::Insert {
-                            collection: name.clone(),
-                            doc_id: doc.id.clone(),
-                            data: doc.data_without_id(),
-                        });
-                    }
-                }
-
-                for field in col.list_indexes() {
-                    ops.push(WalOperation::CreateIndex {
+            let col = read_collection(col_arc)?;
+            for doc_id in col.doc_ids() {
+                if let Ok(doc) = col.get(&doc_id) {
+                    ops.push(WalOperation::Insert {
                         collection: name.clone(),
-                        field,
+                        doc_id: doc.id.clone(),
+                        data: doc.data_without_id(),
                     });
                 }
             }
-            ops
-        };
+
+            for field in col.list_indexes() {
+                ops.push(WalOperation::CreateIndex {
+                    collection: name.clone(),
+                    field,
+                });
+            }
+        }
 
         // Atomically replace WAL with the compacted snapshot
+        // (collections write lock still held — no mutations can interleave)
         self.wal.replace_all(ops)?;
         Ok(())
     }
@@ -1186,5 +1190,63 @@ mod tests {
         db.create_collection("test").unwrap();
         db.insert("test", json!({"_id": "1", "x": 1})).unwrap();
         db.flush().unwrap(); // Should not panic
+    }
+
+    #[test]
+    fn test_open_readonly_sees_flushed_data() {
+        let dir = tempdir().unwrap();
+
+        // Write data and flush
+        {
+            let db = Database::open(dir.path()).unwrap();
+            db.create_collection("users").unwrap();
+            db.create_collection("orders").unwrap();
+            db.insert("users", json!({"_id": "1", "name": "Alice"})).unwrap();
+            db.insert("users", json!({"_id": "2", "name": "Bob"})).unwrap();
+            db.insert("orders", json!({"_id": "o1", "item": "widget"})).unwrap();
+            db.create_index("users", "name").unwrap();
+            db.flush().unwrap();
+        }
+
+        // open_readonly should see everything
+        let db = Database::open_readonly(dir.path()).unwrap();
+        let mut cols = db.list_collections();
+        cols.sort();
+        assert_eq!(cols, vec!["orders", "users"]);
+
+        let doc = db.get("users", "1").unwrap();
+        assert_eq!(doc["name"], "Alice");
+
+        let doc = db.get("orders", "o1").unwrap();
+        assert_eq!(doc["item"], "widget");
+
+        assert_eq!(db.count("users", json!({})).unwrap(), 2);
+
+        let indexes = db.list_indexes("users").unwrap();
+        assert_eq!(indexes, vec!["name"]);
+    }
+
+    #[test]
+    fn test_open_readonly_unflushed_data_not_visible() {
+        let dir = tempdir().unwrap();
+
+        // Write data but DON'T flush — only drop (which flushes via Drop impl)
+        {
+            let db = Database::open(dir.path()).unwrap();
+            db.create_collection("visible").unwrap();
+            db.insert("visible", json!({"_id": "1", "x": 1})).unwrap();
+            db.flush().unwrap();
+
+            // These are buffered but not flushed yet
+            db.create_collection("maybe").unwrap();
+            db.insert("maybe", json!({"_id": "2", "x": 2})).unwrap();
+            // Drop will flush, so both should be visible
+        }
+
+        let db = Database::open_readonly(dir.path()).unwrap();
+        let mut cols = db.list_collections();
+        cols.sort();
+        // Both should be visible because Drop flushes
+        assert_eq!(cols, vec!["maybe", "visible"]);
     }
 }
