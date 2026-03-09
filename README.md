@@ -87,6 +87,9 @@ cargo build --release
 cargo build --release --features redis
 ./target/release/fluxdb --redis
 
+# Build the CLI client
+cargo build --release --features cli
+
 # Generate a config file
 ./target/release/fluxdb --init-config fluxdb.toml
 ```
@@ -96,14 +99,24 @@ Defaults to `./fluxdb_data` for data and `127.0.0.1:7654` for the JSON protocol.
 ### Try it out
 
 ```bash
-# Create a collection
-echo '{"cmd":"create_collection","name":"users"}' | nc localhost 7654
+# Interactive REPL
+fluxdb-cli
+fluxdb> create collection users
+fluxdb> insert users {"name": "Alice", "age": 30}
+fluxdb> find users {"age": {"$gte": 25}}
+fluxdb> count users
+fluxdb> list collections
 
-# Insert a document
-echo '{"cmd":"insert","collection":"users","document":{"name":"Alice","age":30}}' | nc localhost 7654
+# One-shot commands
+fluxdb-cli --cmd 'insert users {"name":"Bob","age":25}'
+fluxdb-cli --cmd 'find users {"age":{"$gte":20}} --limit 10 --sort {"age":-1}'
+fluxdb-cli --cmd stats --raw | jq .
 
-# Query it back
-echo '{"cmd":"find","collection":"users","filter":{"age":{"$gte":25}}}' | nc localhost 7654
+# With authentication
+fluxdb-cli --auth-token my-secret --cmd stats
+
+# Connect to a remote server
+fluxdb-cli -H 10.0.0.1 -p 7654
 
 # Or use Redis protocol
 redis-cli SET hello world
@@ -195,6 +208,7 @@ client_addr = "127.0.0.1:7654"
 | `persistence` | yes (via server) | WAL-based disk persistence |
 | `redis` | no | Redis-compatible protocol server |
 | `cluster` | no | Distributed cluster mode |
+| `cli` | no | Interactive CLI client (`fluxdb-cli` binary) |
 
 To use FluxDB as an embedded library without the server:
 
@@ -437,6 +451,7 @@ src/
   database.rs      — database engine, per-collection RwLocks, WAL replay
   server.rs        — async TCP server (tokio), command dispatch
   redis.rs         — Redis RESP protocol server
+  bin/fluxdb_cli.rs — interactive CLI client with REPL and shorthand commands
   cluster/
     ring.rs        — consistent hash ring (128 vnodes, CRC32)
     router.rs      — command routing, scatter-gather, broadcast

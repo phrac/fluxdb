@@ -9,6 +9,7 @@ persistence = []
 server = ["persistence", "dep:tokio", "dep:clap", "dep:toml"]
 redis = ["server"]
 cluster = ["server"]
+cli = ["dep:tokio", "dep:clap", "dep:rustyline", "dep:colored"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +23,8 @@ bincode = "1"
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "signal", "rt-multi-thread", "macros"], optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
+rustyline = { version = "15", features = ["derive"], optional = true }
+colored = { version = "2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
@@ -46,3 +49,8 @@ harness = false
 [[bin]]
 name = "fluxdb"
 required-features = ["server"]
+
+[[bin]]
+name = "fluxdb-cli"
+path = "src/bin/fluxdb_cli.rs"
+required-features = ["cli"]
