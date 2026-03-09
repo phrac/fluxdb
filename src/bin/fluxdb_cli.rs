@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process;
+use std::time::Instant;
 
 use clap::Parser;
 use colored::Colorize;
@@ -42,9 +44,16 @@ struct CliArgs {
     raw: bool,
 }
 
-// ── Backend trait ────────────────────────────────────────────────────────────
+// ── REPL display state ───────────────────────────────────────────────────────
 
-/// Commands that are read-only and allowed in local mode.
+struct DisplayState {
+    expanded: bool,
+    timing: bool,
+    raw: bool,
+}
+
+// ── Backend ──────────────────────────────────────────────────────────────────
+
 const READ_ONLY_CMDS: &[&str] = &[
     "get",
     "find",
@@ -143,7 +152,6 @@ impl LocalBackend {
     }
 
     fn execute(&self, request: &Value) -> Result<Value, String> {
-        // Enforce read-only
         if let Some(cmd) = request["cmd"].as_str() {
             if !READ_ONLY_CMDS.contains(&cmd) {
                 return Ok(
@@ -160,12 +168,10 @@ impl LocalBackend {
 fn parse_shorthand(input: &str) -> Result<Value, String> {
     let trimmed = input.trim();
 
-    // Raw JSON pass-through
     if trimmed.starts_with('{') {
         return serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON: {e}"));
     }
 
-    // Split into tokens, but treat everything from the first '{' onward as a single JSON blob
     let (tokens, json_blob) = split_tokens(trimmed);
 
     if tokens.is_empty() {
@@ -173,19 +179,16 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
     }
 
     match tokens[0].as_str() {
-        // No-arg commands
         "stats" => Ok(json!({"cmd": "stats"})),
         "compact" => Ok(json!({"cmd": "compact"})),
         "flush" => Ok(json!({"cmd": "flush"})),
         "cluster_status" => Ok(json!({"cmd": "cluster_status"})),
 
-        // Auth
         "auth" => {
             let token = tokens.get(1).ok_or("usage: auth <token>")?;
             Ok(json!({"cmd": "auth", "token": token}))
         }
 
-        // List
         "list" => match tokens.get(1).map(|s| s.as_str()) {
             Some("collections") => Ok(json!({"cmd": "list_collections"})),
             Some("indexes") => {
@@ -195,7 +198,6 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
             _ => Err("usage: list collections | list indexes <collection>".into()),
         },
 
-        // Create
         "create" => match tokens.get(1).map(|s| s.as_str()) {
             Some("collection") => {
                 let name = tokens.get(2).ok_or("usage: create collection <name>")?;
@@ -211,7 +213,6 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
             ),
         },
 
-        // Drop
         "drop" => match tokens.get(1).map(|s| s.as_str()) {
             Some("collection") => {
                 let name = tokens.get(2).ok_or("usage: drop collection <name>")?;
@@ -225,7 +226,6 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
             _ => Err("usage: drop collection <name> | drop index <collection> <field>".into()),
         },
 
-        // Insert
         "insert" => {
             let col = tokens.get(1).ok_or("usage: insert <collection> <json>")?;
             let doc_str = json_blob.ok_or("usage: insert <collection> <json>")?;
@@ -234,14 +234,12 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
             Ok(json!({"cmd": "insert", "collection": col, "document": doc}))
         }
 
-        // Get
         "get" => {
             let col = tokens.get(1).ok_or("usage: get <collection> <id>")?;
             let id = tokens.get(2).ok_or("usage: get <collection> <id>")?;
             Ok(json!({"cmd": "get", "collection": col, "id": id}))
         }
 
-        // Update
         "update" => {
             let col = tokens.get(1).ok_or("usage: update <collection> <id> <json>")?;
             let id = tokens.get(2).ok_or("usage: update <collection> <id> <json>")?;
@@ -251,14 +249,12 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
             Ok(json!({"cmd": "update", "collection": col, "id": id, "document": doc}))
         }
 
-        // Delete
         "delete" => {
             let col = tokens.get(1).ok_or("usage: delete <collection> <id>")?;
             let id = tokens.get(2).ok_or("usage: delete <collection> <id>")?;
             Ok(json!({"cmd": "delete", "collection": col, "id": id}))
         }
 
-        // Find
         "find" => {
             let col = tokens.get(1).ok_or("usage: find <collection> [filter_json]")?;
             let mut cmd = json!({"cmd": "find", "collection": col});
@@ -269,7 +265,6 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
                 cmd["filter"] = filter;
             }
 
-            // Parse trailing --limit, --skip, --sort from tokens after the collection
             let rest: Vec<&str> = tokens[2..].iter().map(|s| s.as_str()).collect();
             let mut i = 0;
             while i < rest.len() {
@@ -306,7 +301,6 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
             Ok(cmd)
         }
 
-        // Count
         "count" => {
             let col = tokens.get(1).ok_or("usage: count <collection> [filter_json]")?;
             let mut cmd = json!({"cmd": "count", "collection": col});
@@ -318,12 +312,10 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
             Ok(cmd)
         }
 
-        other => Err(format!("unknown command: {other}. Type 'help' for usage.")),
+        other => Err(format!("unknown command: {other}. Type \\? for help.")),
     }
 }
 
-/// Split input into whitespace-separated tokens (before first '{') and an optional
-/// JSON blob (everything from the first '{' to end of line).
 fn split_tokens(input: &str) -> (Vec<String>, Option<String>) {
     if let Some(brace_pos) = input.find('{') {
         let before = &input[..brace_pos];
@@ -336,116 +328,520 @@ fn split_tokens(input: &str) -> (Vec<String>, Option<String>) {
     }
 }
 
-// ── Output formatting ────────────────────────────────────────────────────────
+// ── Table formatting ─────────────────────────────────────────────────────────
 
-fn format_response(value: &Value, raw: bool) -> String {
-    if raw {
-        return serde_json::to_string(value).unwrap_or_default();
+/// Format a list of JSON documents as an aligned table (psql-style).
+fn format_table(docs: &[Value]) -> String {
+    if docs.is_empty() {
+        return "(0 rows)\n".to_string();
     }
 
-    let pretty = serde_json::to_string_pretty(value).unwrap_or_default();
-    colorize_json(&pretty, value)
-}
-
-fn colorize_json(pretty: &str, value: &Value) -> String {
-    let ok = value.get("ok").and_then(|v| v.as_bool());
-    let mut result = String::new();
-
-    for line in pretty.lines() {
-        let colored_line = if line.contains("\"ok\": true") {
-            line.replace("true", &"true".green().to_string())
-        } else if line.contains("\"ok\": false") {
-            line.replace("false", &"false".red().to_string())
-        } else if line.contains("\"error\":") {
-            line.red().to_string()
-        } else {
-            line.to_string()
-        };
-        result.push_str(&colored_line);
-        result.push('\n');
-    }
-
-    // Add a status line for quick scanning
-    match ok {
-        Some(true) => {
-            // Don't add extra noise for success
-        }
-        Some(false) => {
-            if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
-                result.push_str(&format!("{}", format!("Error: {err}").red().bold()));
-                result.push('\n');
+    // Collect all unique keys in stable order (_id first, then alphabetical)
+    let mut keys = BTreeSet::new();
+    for doc in docs {
+        if let Some(obj) = doc.as_object() {
+            for k in obj.keys() {
+                keys.insert(k.clone());
             }
         }
-        None => {}
     }
 
-    result
+    // Put _id first
+    let mut columns: Vec<String> = Vec::with_capacity(keys.len());
+    if keys.contains("_id") {
+        columns.push("_id".to_string());
+    }
+    for k in &keys {
+        if k != "_id" {
+            columns.push(k.clone());
+        }
+    }
+
+    // Build cell values
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(docs.len());
+    for doc in docs {
+        let mut row = Vec::with_capacity(columns.len());
+        for col in &columns {
+            let val = doc.get(col).unwrap_or(&Value::Null);
+            row.push(format_cell(val));
+        }
+        rows.push(row);
+    }
+
+    // Calculate column widths
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let mut out = String::new();
+
+    // Header
+    let header: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!(" {:<width$} ", c, width = widths[i]))
+        .collect();
+    out.push_str(&header.join("|"));
+    out.push('\n');
+
+    // Separator
+    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(w + 2)).collect();
+    out.push_str(&sep.join("+"));
+    out.push('\n');
+
+    // Rows
+    for row in &rows {
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| format!(" {:<width$} ", cell, width = widths[i]))
+            .collect();
+        out.push_str(&cells.join("|"));
+        out.push('\n');
+    }
+
+    // Row count
+    let n = rows.len();
+    out.push_str(&format!("({n} {})\n", if n == 1 { "row" } else { "rows" }));
+
+    out
+}
+
+/// Format a single document in expanded (vertical) display.
+fn format_expanded(docs: &[Value]) -> String {
+    if docs.is_empty() {
+        return "(0 rows)\n".to_string();
+    }
+
+    let mut out = String::new();
+
+    for (idx, doc) in docs.iter().enumerate() {
+        out.push_str(&format!(
+            "{}\n",
+            format!("-[ RECORD {} ]", idx + 1).bold()
+        ));
+
+        if let Some(obj) = doc.as_object() {
+            let max_key = obj.keys().map(|k| k.len()).max().unwrap_or(0);
+
+            // _id first
+            if let Some(val) = obj.get("_id") {
+                out.push_str(&format!(
+                    "{:<width$} | {}\n",
+                    "_id",
+                    format_cell(val),
+                    width = max_key
+                ));
+            }
+
+            for (k, v) in obj {
+                if k == "_id" {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "{:<width$} | {}\n",
+                    k,
+                    format_cell(v),
+                    width = max_key
+                ));
+            }
+        }
+    }
+
+    let n = docs.len();
+    out.push_str(&format!("({n} {})\n", if n == 1 { "row" } else { "rows" }));
+    out
+}
+
+/// Format a JSON value as a table cell string.
+fn format_cell(val: &Value) -> String {
+    match val {
+        Value::Null => "".to_string(),
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+        Value::Array(a) => {
+            let items: Vec<String> = a.iter().map(|v| format_cell(v)).collect();
+            format!("{{{}}}", items.join(","))
+        }
+        Value::Object(_) => serde_json::to_string(val).unwrap_or_default(),
+    }
+}
+
+/// Format a list_collections response as a table.
+fn format_collections_table(collections: &[Value]) -> String {
+    if collections.is_empty() {
+        return "(0 collections)\n".to_string();
+    }
+
+    let mut out = String::new();
+    let max_len = collections
+        .iter()
+        .filter_map(|c| c.as_str())
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    out.push_str(&format!(" {:<width$} \n", "Name", width = max_len));
+    out.push_str(&format!("{}\n", "-".repeat(max_len + 2)));
+
+    for col in collections {
+        if let Some(name) = col.as_str() {
+            out.push_str(&format!(" {:<width$} \n", name, width = max_len));
+        }
+    }
+
+    let n = collections.len();
+    out.push_str(&format!(
+        "({n} {})\n",
+        if n == 1 { "collection" } else { "collections" }
+    ));
+    out
+}
+
+/// Format a list_indexes response as a table.
+fn format_indexes_table(indexes: &[Value]) -> String {
+    if indexes.is_empty() {
+        return "(0 indexes)\n".to_string();
+    }
+
+    let mut out = String::new();
+    let max_len = indexes
+        .iter()
+        .filter_map(|i| i.as_str())
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+
+    out.push_str(&format!(" {:<width$} \n", "Field", width = max_len));
+    out.push_str(&format!("{}\n", "-".repeat(max_len + 2)));
+
+    for idx in indexes {
+        if let Some(field) = idx.as_str() {
+            out.push_str(&format!(" {:<width$} \n", field, width = max_len));
+        }
+    }
+
+    let n = indexes.len();
+    out.push_str(&format!(
+        "({n} {})\n",
+        if n == 1 { "index" } else { "indexes" }
+    ));
+    out
+}
+
+/// Format a stats response as key-value pairs.
+fn format_stats(stats: &Value) -> String {
+    let mut out = String::new();
+
+    if let Some(s) = stats.get("stats").and_then(|v| v.as_object()) {
+        if let Some(name) = s.get("database").and_then(|v| v.as_str()) {
+            out.push_str(&format!("Database:    {name}\n"));
+        }
+        if let Some(n) = s.get("collections").and_then(|v| v.as_u64()) {
+            out.push_str(&format!("Collections: {n}\n"));
+        }
+        if let Some(n) = s.get("total_documents").and_then(|v| v.as_u64()) {
+            out.push_str(&format!("Documents:   {n}\n"));
+        }
+
+        if let Some(details) = s.get("collection_details").and_then(|v| v.as_object()) {
+            if !details.is_empty() {
+                out.push('\n');
+                // Build a table of collection details
+                let mut col_width = 10usize;
+                let mut idx_details: Vec<(&str, u64, Vec<&str>)> = Vec::new();
+
+                for (name, info) in details {
+                    col_width = col_width.max(name.len());
+                    let doc_count = info
+                        .get("documents")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let indexes: Vec<&str> = info
+                        .get("indexes")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+                    idx_details.push((name.as_str(), doc_count, indexes));
+                }
+
+                out.push_str(&format!(
+                    " {:<cw$} | {:>9} | Indexes\n",
+                    "Collection",
+                    "Documents",
+                    cw = col_width
+                ));
+                out.push_str(&format!(
+                    "{}+{}+{}\n",
+                    "-".repeat(col_width + 2),
+                    "-".repeat(11),
+                    "-".repeat(20)
+                ));
+
+                for (name, docs, indexes) in &idx_details {
+                    let idx_str = if indexes.is_empty() {
+                        "none".to_string()
+                    } else {
+                        indexes.join(", ")
+                    };
+                    out.push_str(&format!(
+                        " {:<cw$} | {:>9} | {idx_str}\n",
+                        name,
+                        docs,
+                        cw = col_width
+                    ));
+                }
+            }
+        }
+    }
+
+    out
+}
+
+// ── Response formatting ──────────────────────────────────────────────────────
+
+fn format_response(resp: &Value, cmd: Option<&str>, display: &DisplayState) -> String {
+    // Error responses always show as JSON
+    if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+            return format!("{}\n", format!("ERROR: {err}").red());
+        }
+        return format_json(resp);
+    }
+
+    if display.raw {
+        return format_json(resp);
+    }
+
+    match cmd {
+        Some("find") => {
+            if let Some(docs) = resp.get("documents").and_then(|v| v.as_array()) {
+                if display.expanded {
+                    format_expanded(docs)
+                } else {
+                    format_table(docs)
+                }
+            } else {
+                format_json(resp)
+            }
+        }
+        Some("get") => {
+            if let Some(doc) = resp.get("document") {
+                if display.expanded {
+                    format_expanded(&[doc.clone()])
+                } else {
+                    format_table(&[doc.clone()])
+                }
+            } else {
+                format_json(resp)
+            }
+        }
+        Some("count") => {
+            let n = resp.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            format!(" count \n-------\n {n:<5} \n(1 row)\n")
+        }
+        Some("list_collections") => {
+            if let Some(cols) = resp.get("collections").and_then(|v| v.as_array()) {
+                format_collections_table(cols)
+            } else {
+                format_json(resp)
+            }
+        }
+        Some("list_indexes") => {
+            if let Some(idxs) = resp.get("indexes").and_then(|v| v.as_array()) {
+                format_indexes_table(idxs)
+            } else {
+                format_json(resp)
+            }
+        }
+        Some("stats") => format_stats(resp),
+        Some("insert") => {
+            if let Some(id) = resp.get("id").and_then(|v| v.as_str()) {
+                format!("INSERT 1\nid: {id}\n")
+            } else {
+                "INSERT 1\n".to_string()
+            }
+        }
+        Some("update") => "UPDATE 1\n".to_string(),
+        Some("delete") => {
+            let deleted = resp.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false);
+            if deleted {
+                "DELETE 1\n".to_string()
+            } else {
+                "DELETE 0\n".to_string()
+            }
+        }
+        Some("create_collection") => "CREATE COLLECTION\n".to_string(),
+        Some("drop_collection") => "DROP COLLECTION\n".to_string(),
+        Some("create_index") => "CREATE INDEX\n".to_string(),
+        Some("drop_index") => "DROP INDEX\n".to_string(),
+        Some("compact") => "COMPACT\n".to_string(),
+        Some("flush") => "FLUSH\n".to_string(),
+        Some("auth") => "OK\n".to_string(),
+        _ => format_json(resp),
+    }
+}
+
+fn format_json(value: &Value) -> String {
+    let mut s = serde_json::to_string_pretty(value).unwrap_or_default();
+    s.push('\n');
+    s
+}
+
+fn format_timing(elapsed: std::time::Duration) -> String {
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    if ms < 1.0 {
+        format!("Time: {:.3} ms\n", ms)
+    } else {
+        format!("Time: {:.1} ms\n", ms)
+    }
+}
+
+/// Extract the command name from a request JSON for display formatting.
+fn cmd_name(request: &Value) -> Option<String> {
+    request.get("cmd").and_then(|v| v.as_str()).map(String::from)
+}
+
+// ── Backslash commands ───────────────────────────────────────────────────────
+
+/// Handle a backslash meta-command. Returns Some(request) if it maps to a
+/// server command, or None if it was handled locally.
+fn handle_backslash(input: &str, display: &mut DisplayState, is_local: bool) -> Option<Value> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let cmd = parts.first().map(|s| *s).unwrap_or("");
+
+    match cmd {
+        "\\?" | "\\h" | "\\help" => {
+            print_help(is_local);
+            None
+        }
+        "\\q" | "\\quit" => {
+            process::exit(0);
+        }
+        "\\dt" => Some(json!({"cmd": "list_collections"})),
+        "\\di" => {
+            if let Some(col) = parts.get(1) {
+                Some(json!({"cmd": "list_indexes", "collection": col}))
+            } else {
+                eprintln!("{}", "usage: \\di <collection>".red());
+                None
+            }
+        }
+        "\\d" => {
+            // \d <collection> — show collection info (doc count + indexes)
+            if let Some(col) = parts.get(1) {
+                // We'll use stats and filter, but simpler to use list_indexes
+                // and let the display handle it. Return a special marker.
+                Some(json!({"cmd": "list_indexes", "collection": col}))
+            } else {
+                // \d with no args = list collections
+                Some(json!({"cmd": "list_collections"}))
+            }
+        }
+        "\\x" => {
+            display.expanded = !display.expanded;
+            println!(
+                "Expanded display is {}.",
+                if display.expanded { "on" } else { "off" }
+            );
+            None
+        }
+        "\\timing" => {
+            display.timing = !display.timing;
+            println!(
+                "Timing is {}.",
+                if display.timing { "on" } else { "off" }
+            );
+            None
+        }
+        "\\raw" => {
+            display.raw = !display.raw;
+            println!(
+                "Raw JSON output is {}.",
+                if display.raw { "on" } else { "off" }
+            );
+            None
+        }
+        "\\conninfo" => {
+            if is_local {
+                println!("Local read-only mode.");
+            } else {
+                println!("Network mode (use --host / --port to configure).");
+            }
+            None
+        }
+        _ => {
+            eprintln!(
+                "{}",
+                format!("Invalid command: {cmd}. Try \\? for help.").red()
+            );
+            None
+        }
+    }
 }
 
 // ── Help text ────────────────────────────────────────────────────────────────
 
-fn print_help(local: bool) {
-    if local {
-        println!(
-            "{}",
-            r#"
-Read-only local mode. Only query commands are available.
+fn print_help(is_local: bool) {
+    let mode = if is_local {
+        "Read-only local mode. Only query commands are available.\n\n"
+    } else {
+        ""
+    };
 
-Commands:
+    println!(
+        "{mode}{}",
+        r#"General
+  \?                 Show this help
+  \q                 Quit
+  \x                 Toggle expanded display (vertical)
+  \timing            Toggle query timing
+  \raw               Toggle raw JSON output
+  \conninfo          Show connection info
+
+Informational
+  \dt                List collections
+  \di <collection>   List indexes on a collection
+  \d                 List collections
+  \d  <collection>   Describe a collection (indexes)
+
+Commands
   stats                                   Show database statistics
-  list collections                        List all collections
-  list indexes <collection>               List indexes on a collection
-
   get <collection> <id>                   Get a document by ID
   find <collection> [filter] [options]    Query documents
     Options: --limit N  --skip N  --sort {"field": 1}
   count <collection> [filter]             Count matching documents
+  list collections                        List all collections
+  list indexes <collection>               List indexes"#
+    );
 
-  help                                    Show this help
-  exit / quit / Ctrl-D                    Disconnect
-
-Raw JSON is also accepted:
-  {"cmd":"find","collection":"users","filter":{"age":{"$gte":25}}}
-"#
-            .trim()
-        );
-    } else {
+    if !is_local {
         println!(
             "{}",
             r#"
-Commands:
-  stats                                   Show database statistics
-  compact                                 Compact the WAL
-  flush                                   Flush WAL to disk
-  cluster_status                          Show cluster status
-
-  list collections                        List all collections
-  create collection <name>                Create a collection
-  drop collection <name>                  Drop a collection
-
   insert <collection> <json>              Insert a document
-  get <collection> <id>                   Get a document by ID
   update <collection> <id> <json>         Replace a document
   delete <collection> <id>                Delete a document
-
-  find <collection> [filter] [options]    Query documents
-    Options: --limit N  --skip N  --sort {"field": 1}
-  count <collection> [filter]             Count matching documents
-
-  create index <collection> <field>       Create a secondary index
+  create collection <name>                Create a collection
+  drop collection <name>                  Drop a collection
+  create index <collection> <field>       Create an index
   drop index <collection> <field>         Drop an index
-  list indexes <collection>               List indexes on a collection
-
-  auth <token>                            Authenticate with the server
-  help                                    Show this help
-  exit / quit / Ctrl-D                    Disconnect
-
-Raw JSON is also accepted:
-  {"cmd":"find","collection":"users","filter":{"age":{"$gte":25}}}
-"#
-            .trim()
+  compact                                 Compact the WAL
+  flush                                   Flush WAL to disk
+  auth <token>                            Authenticate"#
         );
     }
+
+    println!(
+        "\n{}",
+        "Raw JSON is also accepted: {\"cmd\":\"find\",\"collection\":\"users\"}"
+    );
 }
 
 // ── Tab completion ───────────────────────────────────────────────────────────
@@ -468,6 +864,15 @@ static COMMANDS: &[&str] = &[
     "find",
     "count",
     "auth",
+    "\\dt",
+    "\\di",
+    "\\d",
+    "\\x",
+    "\\timing",
+    "\\raw",
+    "\\conninfo",
+    "\\q",
+    "\\?",
     "help",
     "exit",
     "quit",
@@ -515,7 +920,6 @@ async fn main() {
     let args = CliArgs::parse();
 
     let mut backend = if let Some(ref data_dir) = args.data_dir {
-        // Local read-only mode
         match LocalBackend::open(data_dir) {
             Ok(local) => Backend::Local(local),
             Err(e) => {
@@ -524,7 +928,6 @@ async fn main() {
             }
         }
     } else {
-        // Network mode
         let mut net = match NetworkBackend::connect(&args.host, args.port).await {
             Ok(c) => c,
             Err(e) => {
@@ -543,19 +946,42 @@ async fn main() {
         Backend::Network(net)
     };
 
+    let mut display = DisplayState {
+        expanded: false,
+        timing: false,
+        raw: args.raw,
+    };
+
     // One-shot mode
-    if let Some(ref cmd) = args.cmd {
-        let request = match parse_shorthand(cmd) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("{}", e.red());
-                process::exit(1);
+    if let Some(ref cmd_str) = args.cmd {
+        let request = if cmd_str.starts_with('\\') {
+            match handle_backslash(cmd_str, &mut display, backend.is_local()) {
+                Some(r) => r,
+                None => process::exit(0),
+            }
+        } else {
+            match parse_shorthand(cmd_str) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{}", e.red());
+                    process::exit(1);
+                }
             }
         };
 
+        let cmd = cmd_name(&request);
+        let start = Instant::now();
+
         match backend.execute(&request).await {
             Ok(resp) => {
-                print!("{}", format_response(&resp, args.raw));
+                let elapsed = start.elapsed();
+                print!(
+                    "{}",
+                    format_response(&resp, cmd.as_deref(), &display)
+                );
+                if display.timing {
+                    print!("{}", format_timing(elapsed));
+                }
                 let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
                 process::exit(if ok { 0 } else { 1 });
             }
@@ -567,10 +993,10 @@ async fn main() {
     }
 
     // REPL mode
-    run_repl(&mut backend, &args).await;
+    run_repl(&mut backend, &args, &mut display).await;
 }
 
-async fn run_repl(backend: &mut Backend, args: &CliArgs) {
+async fn run_repl(backend: &mut Backend, args: &CliArgs, display: &mut DisplayState) {
     let config = Config::builder()
         .history_ignore_space(true)
         .completion_type(CompletionType::List)
@@ -587,20 +1013,16 @@ async fn run_repl(backend: &mut Backend, args: &CliArgs) {
     let history_path = dirs_home().join(".fluxdb_cli_history");
     let _ = rl.load_history(&history_path);
 
+    // psql-style banner
     if backend.is_local() {
         println!(
-            "Opened {} (read-only). Type {} for commands.",
-            args.data_dir.as_ref().unwrap().display(),
-            "help".bold()
+            "fluxdb-cli (read-only) — {}",
+            args.data_dir.as_ref().unwrap().display()
         );
     } else {
-        println!(
-            "Connected to {}:{}. Type {} for commands.",
-            args.host,
-            args.port,
-            "help".bold()
-        );
+        println!("fluxdb-cli — {}:{}", args.host, args.port);
     }
+    println!("Type \\? for help.\n");
 
     let prompt = if backend.is_local() {
         "fluxdb (ro)> "
@@ -628,6 +1050,35 @@ async fn run_repl(backend: &mut Backend, args: &CliArgs) {
                     _ => {}
                 }
 
+                // Backslash commands
+                if trimmed.starts_with('\\') {
+                    let request =
+                        match handle_backslash(trimmed, display, backend.is_local()) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+
+                    let cmd = cmd_name(&request);
+                    let start = Instant::now();
+                    match backend.execute(&request).await {
+                        Ok(resp) => {
+                            let elapsed = start.elapsed();
+                            print!(
+                                "{}",
+                                format_response(&resp, cmd.as_deref(), display)
+                            );
+                            if display.timing {
+                                print!("{}", format_timing(elapsed));
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{}", format!("ERROR: {e}").red().bold());
+                        }
+                    }
+                    continue;
+                }
+
+                // Regular commands
                 let request = match parse_shorthand(trimmed) {
                     Ok(r) => r,
                     Err(e) => {
@@ -636,12 +1087,22 @@ async fn run_repl(backend: &mut Backend, args: &CliArgs) {
                     }
                 };
 
+                let cmd = cmd_name(&request);
+                let start = Instant::now();
+
                 match backend.execute(&request).await {
                     Ok(resp) => {
-                        print!("{}", format_response(&resp, args.raw));
+                        let elapsed = start.elapsed();
+                        print!(
+                            "{}",
+                            format_response(&resp, cmd.as_deref(), display)
+                        );
+                        if display.timing {
+                            print!("{}", format_timing(elapsed));
+                        }
                     }
                     Err(e) => {
-                        eprintln!("{}", format!("Error: {e}").red().bold());
+                        eprintln!("{}", format!("ERROR: {e}").red().bold());
                         if !backend.is_local() {
                             eprintln!("Attempting to reconnect...");
                             match NetworkBackend::connect(&args.host, args.port).await {
