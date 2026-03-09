@@ -977,9 +977,31 @@ static COMMANDS: &[&str] = &[
     "quit",
 ];
 
+/// Commands that take a collection name as the word right after the command.
+const COLLECTION_ARG_CMDS: &[&str] = &[
+    "find", "insert", "get", "update", "delete", "count",
+];
+
+/// Two-word commands where the third word is a collection name.
+const COLLECTION_ARG3_PREFIXES: &[&str] = &[
+    "create index", "drop index", "drop collection", "list indexes",
+];
+
+/// Second-word completions for multi-word commands.
+const CREATE_SUBCOMMANDS: &[&str] = &["collection", "index"];
+const DROP_SUBCOMMANDS: &[&str] = &["collection", "index"];
+const LIST_SUBCOMMANDS: &[&str] = &["collections", "indexes"];
+
 #[derive(rustyline::Helper)]
 struct CliHelper {
     hinter: HistoryHinter,
+    collections: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl CliHelper {
+    fn get_collections(&self) -> Vec<String> {
+        self.collections.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 impl rustyline::completion::Completer for CliHelper {
@@ -992,12 +1014,68 @@ impl rustyline::completion::Completer for CliHelper {
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<String>)> {
         let prefix = &line[..pos];
-        let matches: Vec<String> = COMMANDS
-            .iter()
-            .filter(|cmd| cmd.starts_with(prefix))
-            .map(|cmd| cmd.to_string())
-            .collect();
-        Ok((0, matches))
+
+        // Split into words for context-aware completion
+        let words: Vec<&str> = prefix.split_whitespace().collect();
+        let trailing_space = prefix.ends_with(' ');
+        let completing_word = if trailing_space { "" } else { words.last().copied().unwrap_or("") };
+        let complete_words = if trailing_space { words.len() } else { words.len().saturating_sub(1) };
+
+        // Word 0: complete command names
+        if complete_words == 0 {
+            let matches: Vec<String> = COMMANDS
+                .iter()
+                .filter(|cmd| cmd.starts_with(completing_word))
+                .map(|cmd| cmd.to_string())
+                .collect();
+            return Ok((0, matches));
+        }
+
+        let first = words[0];
+
+        // Word 1 for multi-word commands: complete subcommands
+        if complete_words == 1 {
+            let subs = match first {
+                "create" => Some(CREATE_SUBCOMMANDS),
+                "drop" => Some(DROP_SUBCOMMANDS),
+                "list" => Some(LIST_SUBCOMMANDS),
+                _ => None,
+            };
+            if let Some(subs) = subs {
+                let word_start = prefix.len() - completing_word.len();
+                let matches: Vec<String> = subs
+                    .iter()
+                    .filter(|s| s.starts_with(completing_word))
+                    .map(|s| s.to_string())
+                    .collect();
+                return Ok((word_start, matches));
+            }
+        }
+
+        // Word 1 for single-word commands that take a collection
+        if complete_words == 1 && COLLECTION_ARG_CMDS.contains(&first) {
+            let word_start = prefix.len() - completing_word.len();
+            let matches: Vec<String> = self.get_collections()
+                .into_iter()
+                .filter(|c| c.starts_with(completing_word))
+                .collect();
+            return Ok((word_start, matches));
+        }
+
+        // Word 2 for two-word commands that take a collection
+        if complete_words == 2 {
+            let two_word = format!("{} {}", words[0], words[1]);
+            if COLLECTION_ARG3_PREFIXES.iter().any(|p| two_word == *p) {
+                let word_start = prefix.len() - completing_word.len();
+                let matches: Vec<String> = self.get_collections()
+                    .into_iter()
+                    .filter(|c| c.starts_with(completing_word))
+                    .collect();
+                return Ok((word_start, matches));
+            }
+        }
+
+        Ok((pos, vec![]))
     }
 }
 
@@ -1095,6 +1173,31 @@ async fn main() {
     run_repl(&mut backend, &args, &mut display).await;
 }
 
+/// Commands that modify the collection list (trigger a refresh of completions).
+const COLLECTION_MUTATING_CMDS: &[&str] = &[
+    "create_collection", "drop_collection",
+];
+
+/// Fetch collection names from the backend for tab completion.
+async fn fetch_collections(backend: &mut Backend) -> Vec<String> {
+    let req = json!({"cmd": "list_collections"});
+    match backend.execute(&req).await {
+        Ok(resp) => {
+            if let Some(arr) = resp.get("collections").and_then(|v| v.as_array()) {
+                let mut names: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                names.sort();
+                names
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 async fn run_repl(backend: &mut Backend, args: &CliArgs, display: &mut DisplayState) {
     let config = Config::builder()
         .history_ignore_space(true)
@@ -1102,8 +1205,11 @@ async fn run_repl(backend: &mut Backend, args: &CliArgs, display: &mut DisplaySt
         .edit_mode(EditMode::Emacs)
         .build();
 
+    let collections = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
     let helper = CliHelper {
         hinter: HistoryHinter::new(),
+        collections: collections.clone(),
     };
 
     let mut rl = Editor::with_config(config).expect("failed to create editor");
@@ -1111,6 +1217,12 @@ async fn run_repl(backend: &mut Backend, args: &CliArgs, display: &mut DisplaySt
 
     let history_path = dirs_home().join(".fluxdb_cli_history");
     let _ = rl.load_history(&history_path);
+
+    // Seed collection list for tab completion
+    {
+        let names = fetch_collections(backend).await;
+        *collections.lock().unwrap() = names;
+    }
 
     // psql-style banner
     if backend.is_local() {
@@ -1169,6 +1281,10 @@ async fn run_repl(backend: &mut Backend, args: &CliArgs, display: &mut DisplaySt
                             if display.timing {
                                 print!("{}", format_timing(elapsed));
                             }
+                            // Refresh collection list if this command changed it
+                            if cmd.as_deref().map_or(false, |c| COLLECTION_MUTATING_CMDS.contains(&c)) {
+                                *collections.lock().unwrap() = fetch_collections(backend).await;
+                            }
                         }
                         Err(e) => {
                             eprintln!("{}", format!("ERROR: {e}").red().bold());
@@ -1198,6 +1314,9 @@ async fn run_repl(backend: &mut Backend, args: &CliArgs, display: &mut DisplaySt
                         );
                         if display.timing {
                             print!("{}", format_timing(elapsed));
+                        }
+                        if cmd.as_deref().map_or(false, |c| COLLECTION_MUTATING_CMDS.contains(&c)) {
+                            *collections.lock().unwrap() = fetch_collections(backend).await;
                         }
                     }
                     Err(e) => {
