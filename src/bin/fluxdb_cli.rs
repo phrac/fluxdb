@@ -256,59 +256,32 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
         }
 
         "find" => {
-            let col = tokens.get(1).ok_or("usage: find <collection> [filter_json]")?;
-            let mut cmd = json!({"cmd": "find", "collection": col});
+            // find needs special parsing to handle multiple JSON objects
+            // (filter + sort) and interleaved flags
+            let col_str = tokens.get(1).ok_or("usage: find <collection> [filter] [--limit N] [--skip N] [--sort {json}]")?;
+            let mut cmd = json!({"cmd": "find", "collection": col_str});
 
-            if let Some(blob) = json_blob {
-                let filter: Value =
-                    serde_json::from_str(&blob).map_err(|e| format!("invalid filter: {e}"))?;
-                cmd["filter"] = filter;
-            }
-
-            let rest: Vec<&str> = tokens[2..].iter().map(|s| s.as_str()).collect();
-            let mut i = 0;
-            while i < rest.len() {
-                match rest[i] {
-                    "--limit" => {
-                        let n = rest
-                            .get(i + 1)
-                            .ok_or("--limit requires a number")?
-                            .parse::<u64>()
-                            .map_err(|_| "--limit must be a number")?;
-                        cmd["limit"] = json!(n);
-                        i += 2;
-                    }
-                    "--skip" => {
-                        let n = rest
-                            .get(i + 1)
-                            .ok_or("--skip requires a number")?
-                            .parse::<u64>()
-                            .map_err(|_| "--skip must be a number")?;
-                        cmd["skip"] = json!(n);
-                        i += 2;
-                    }
-                    "--sort" => {
-                        let s = rest.get(i + 1).ok_or("--sort requires a JSON object")?;
-                        let sort: Value =
-                            serde_json::from_str(s).map_err(|e| format!("invalid sort: {e}"))?;
-                        cmd["sort"] = sort;
-                        i += 2;
-                    }
-                    _ => i += 1,
-                }
+            // Find where the collection name ends in the original input
+            // and pass everything after it to the balanced parser
+            let after_cmd = trimmed.strip_prefix("find").unwrap().trim_start();
+            let tail = after_cmd.strip_prefix(col_str.as_str()).unwrap_or("").trim_start();
+            if !tail.is_empty() {
+                parse_find_tail(tail, &mut cmd)?;
             }
 
             Ok(cmd)
         }
 
         "count" => {
-            let col = tokens.get(1).ok_or("usage: count <collection> [filter_json]")?;
-            let mut cmd = json!({"cmd": "count", "collection": col});
-            if let Some(blob) = json_blob {
-                let filter: Value =
-                    serde_json::from_str(&blob).map_err(|e| format!("invalid filter: {e}"))?;
-                cmd["filter"] = filter;
+            let col_str = tokens.get(1).ok_or("usage: count <collection> [filter_json]")?;
+            let mut cmd = json!({"cmd": "count", "collection": col_str});
+
+            let after_cmd = trimmed.strip_prefix("count").unwrap().trim_start();
+            let tail = after_cmd.strip_prefix(col_str.as_str()).unwrap_or("").trim_start();
+            if !tail.is_empty() {
+                parse_find_tail(tail, &mut cmd)?;
             }
+
             Ok(cmd)
         }
 
@@ -326,6 +299,132 @@ fn split_tokens(input: &str) -> (Vec<String>, Option<String>) {
         let tokens: Vec<String> = input.split_whitespace().map(String::from).collect();
         (tokens, None)
     }
+}
+
+/// Extract a balanced JSON object from `s` starting at `start`.
+/// Returns `(json_string, end_position)` or None if not valid.
+fn extract_balanced_json(s: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if start >= bytes.len() || bytes[start] != b'{' {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for i in start..bytes.len() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match bytes[i] {
+            b'\\' if in_string => escape = true,
+            b'"' => in_string = !in_string,
+            b'{' if !in_string => depth += 1,
+            b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((s[start..=i].to_string(), i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse the tail of a `find` or `count` command, which can contain an optional
+/// filter JSON, and for find: `--limit N`, `--skip N`, `--sort {json}`.
+///
+/// Handles: `find col {"f":1} --limit 10 --sort {"ts":-1}`
+///          `find col --limit 10 --sort {"ts":-1}`
+///          `find col {"f":1}`
+fn parse_find_tail(tail: &str, cmd: &mut Value) -> Result<(), String> {
+    let mut pos = 0;
+    let bytes = tail.as_bytes();
+
+    // Skip leading whitespace
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+
+    // If the first non-ws char is '{', it's the filter
+    if pos < bytes.len() && bytes[pos] == b'{' {
+        let (json_str, end) = extract_balanced_json(tail, pos)
+            .ok_or_else(|| "unterminated JSON object in filter".to_string())?;
+        let filter: Value =
+            serde_json::from_str(&json_str).map_err(|e| format!("invalid filter: {e}"))?;
+        cmd["filter"] = filter;
+        pos = end;
+    }
+
+    // Now parse flags: --limit N, --skip N, --sort {json}
+    while pos < bytes.len() {
+        // Skip whitespace
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+
+        // Read a token
+        let token_start = pos;
+        while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        let token = &tail[token_start..pos];
+
+        match token {
+            "--limit" => {
+                let n = next_word(tail, &mut pos).ok_or("--limit requires a number")?;
+                let n: u64 = n.parse().map_err(|_| "--limit must be a number")?;
+                cmd["limit"] = json!(n);
+            }
+            "--skip" => {
+                let n = next_word(tail, &mut pos).ok_or("--skip requires a number")?;
+                let n: u64 = n.parse().map_err(|_| "--skip must be a number")?;
+                cmd["skip"] = json!(n);
+            }
+            "--sort" => {
+                // Skip whitespace to find the JSON object
+                while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                    pos += 1;
+                }
+                if pos < bytes.len() && bytes[pos] == b'{' {
+                    let (json_str, end) = extract_balanced_json(tail, pos)
+                        .ok_or_else(|| "unterminated JSON object in --sort".to_string())?;
+                    let sort: Value = serde_json::from_str(&json_str)
+                        .map_err(|e| format!("invalid sort: {e}"))?;
+                    cmd["sort"] = sort;
+                    pos = end;
+                } else {
+                    return Err("--sort requires a JSON object like {\"field\":1}".into());
+                }
+            }
+            _ => {
+                // Ignore unknown tokens
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Read the next whitespace-delimited word from `s` starting at `*pos`,
+/// advancing `*pos` past it.
+fn next_word<'a>(s: &'a str, pos: &mut usize) -> Option<&'a str> {
+    let bytes = s.as_bytes();
+    while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    if *pos >= bytes.len() {
+        return None;
+    }
+    let start = *pos;
+    while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    Some(&s[start..*pos])
 }
 
 // ── Table formatting ─────────────────────────────────────────────────────────
