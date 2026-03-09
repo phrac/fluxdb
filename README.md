@@ -118,6 +118,10 @@ fluxdb-cli --auth-token my-secret --cmd stats
 # Connect to a remote server
 fluxdb-cli -H 10.0.0.1 -p 7654
 
+# Open a data directory directly (read-only, no server needed)
+fluxdb-cli --data-dir ./fluxdb_data
+fluxdb-cli --data-dir ./fluxdb_data --cmd 'find users {"age":{"$gte":25}}'
+
 # Or use Redis protocol
 redis-cli SET hello world
 redis-cli GET hello

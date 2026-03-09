@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
@@ -10,14 +11,21 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
+use fluxdb::database::Database;
+use fluxdb::server::process_command;
+
 #[derive(Parser)]
 #[command(name = "fluxdb-cli", version, about = "FluxDB command-line client")]
 struct CliArgs {
-    /// Server host
+    /// Open a data directory directly (read-only, no server needed)
+    #[arg(short, long)]
+    data_dir: Option<PathBuf>,
+
+    /// Server host (network mode)
     #[arg(short = 'H', long, default_value = "127.0.0.1")]
     host: String,
 
-    /// Server port
+    /// Server port (network mode)
     #[arg(short, long, default_value_t = 7654)]
     port: u16,
 
@@ -25,7 +33,7 @@ struct CliArgs {
     #[arg(short, long)]
     cmd: Option<String>,
 
-    /// Authentication token
+    /// Authentication token (network mode)
     #[arg(long)]
     auth_token: Option<String>,
 
@@ -34,21 +42,52 @@ struct CliArgs {
     raw: bool,
 }
 
-// ── Connection ───────────────────────────────────────────────────────────────
+// ── Backend trait ────────────────────────────────────────────────────────────
 
-struct Connection {
+/// Commands that are read-only and allowed in local mode.
+const READ_ONLY_CMDS: &[&str] = &[
+    "get",
+    "find",
+    "count",
+    "list_collections",
+    "list_indexes",
+    "stats",
+    "cluster_status",
+];
+
+enum Backend {
+    Network(NetworkBackend),
+    Local(LocalBackend),
+}
+
+impl Backend {
+    async fn execute(&mut self, request: &Value) -> Result<Value, String> {
+        match self {
+            Backend::Network(n) => n.send(request).await,
+            Backend::Local(l) => l.execute(request),
+        }
+    }
+
+    fn is_local(&self) -> bool {
+        matches!(self, Backend::Local(_))
+    }
+}
+
+// ── Network backend ──────────────────────────────────────────────────────────
+
+struct NetworkBackend {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
 }
 
-impl Connection {
+impl NetworkBackend {
     async fn connect(host: &str, port: u16) -> Result<Self, String> {
         let addr = format!("{host}:{port}");
         let stream = TcpStream::connect(&addr)
             .await
             .map_err(|e| format!("failed to connect to {addr}: {e}"))?;
         let (reader, writer) = stream.into_split();
-        Ok(Connection {
+        Ok(NetworkBackend {
             reader: BufReader::new(reader),
             writer,
         })
@@ -87,6 +126,32 @@ impl Connection {
             let err = resp["error"].as_str().unwrap_or("authentication failed");
             Err(err.to_string())
         }
+    }
+}
+
+// ── Local backend ────────────────────────────────────────────────────────────
+
+struct LocalBackend {
+    db: Database,
+}
+
+impl LocalBackend {
+    fn open(data_dir: &std::path::Path) -> Result<Self, String> {
+        let db = Database::open_readonly(data_dir)
+            .map_err(|e| format!("failed to open {}: {e}", data_dir.display()))?;
+        Ok(LocalBackend { db })
+    }
+
+    fn execute(&self, request: &Value) -> Result<Value, String> {
+        // Enforce read-only
+        if let Some(cmd) = request["cmd"].as_str() {
+            if !READ_ONLY_CMDS.contains(&cmd) {
+                return Ok(
+                    json!({"ok": false, "error": format!("read-only mode: '{cmd}' is not allowed")}),
+                );
+            }
+        }
+        Ok(process_command(&self.db, request))
     }
 }
 
@@ -141,7 +206,9 @@ fn parse_shorthand(input: &str) -> Result<Value, String> {
                 let field = tokens.get(3).ok_or("usage: create index <collection> <field>")?;
                 Ok(json!({"cmd": "create_index", "collection": col, "field": field}))
             }
-            _ => Err("usage: create collection <name> | create index <collection> <field>".into()),
+            _ => Err(
+                "usage: create collection <name> | create index <collection> <field>".into(),
+            ),
         },
 
         // Drop
@@ -317,10 +384,35 @@ fn colorize_json(pretty: &str, value: &Value) -> String {
 
 // ── Help text ────────────────────────────────────────────────────────────────
 
-fn print_help() {
-    println!(
-        "{}",
-        r#"
+fn print_help(local: bool) {
+    if local {
+        println!(
+            "{}",
+            r#"
+Read-only local mode. Only query commands are available.
+
+Commands:
+  stats                                   Show database statistics
+  list collections                        List all collections
+  list indexes <collection>               List indexes on a collection
+
+  get <collection> <id>                   Get a document by ID
+  find <collection> [filter] [options]    Query documents
+    Options: --limit N  --skip N  --sort {"field": 1}
+  count <collection> [filter]             Count matching documents
+
+  help                                    Show this help
+  exit / quit / Ctrl-D                    Disconnect
+
+Raw JSON is also accepted:
+  {"cmd":"find","collection":"users","filter":{"age":{"$gte":25}}}
+"#
+            .trim()
+        );
+    } else {
+        println!(
+            "{}",
+            r#"
 Commands:
   stats                                   Show database statistics
   compact                                 Compact the WAL
@@ -351,8 +443,9 @@ Commands:
 Raw JSON is also accepted:
   {"cmd":"find","collection":"users","filter":{"age":{"$gte":25}}}
 "#
-        .trim()
-    );
+            .trim()
+        );
+    }
 }
 
 // ── Tab completion ───────────────────────────────────────────────────────────
@@ -421,21 +514,34 @@ impl rustyline::validate::Validator for CliHelper {}
 async fn main() {
     let args = CliArgs::parse();
 
-    let mut conn = match Connection::connect(&args.host, args.port).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{}", e.red().bold());
-            process::exit(1);
+    let mut backend = if let Some(ref data_dir) = args.data_dir {
+        // Local read-only mode
+        match LocalBackend::open(data_dir) {
+            Ok(local) => Backend::Local(local),
+            Err(e) => {
+                eprintln!("{}", e.red().bold());
+                process::exit(1);
+            }
         }
-    };
+    } else {
+        // Network mode
+        let mut net = match NetworkBackend::connect(&args.host, args.port).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{}", e.red().bold());
+                process::exit(1);
+            }
+        };
 
-    // Authenticate if token provided
-    if let Some(ref token) = args.auth_token {
-        if let Err(e) = conn.authenticate(token).await {
-            eprintln!("{}", format!("Authentication failed: {e}").red().bold());
-            process::exit(1);
+        if let Some(ref token) = args.auth_token {
+            if let Err(e) = net.authenticate(token).await {
+                eprintln!("{}", format!("Authentication failed: {e}").red().bold());
+                process::exit(1);
+            }
         }
-    }
+
+        Backend::Network(net)
+    };
 
     // One-shot mode
     if let Some(ref cmd) = args.cmd {
@@ -447,7 +553,7 @@ async fn main() {
             }
         };
 
-        match conn.send(&request).await {
+        match backend.execute(&request).await {
             Ok(resp) => {
                 print!("{}", format_response(&resp, args.raw));
                 let ok = resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -461,10 +567,10 @@ async fn main() {
     }
 
     // REPL mode
-    run_repl(&mut conn, &args).await;
+    run_repl(&mut backend, &args).await;
 }
 
-async fn run_repl(conn: &mut Connection, args: &CliArgs) {
+async fn run_repl(backend: &mut Backend, args: &CliArgs) {
     let config = Config::builder()
         .history_ignore_space(true)
         .completion_type(CompletionType::List)
@@ -481,15 +587,29 @@ async fn run_repl(conn: &mut Connection, args: &CliArgs) {
     let history_path = dirs_home().join(".fluxdb_cli_history");
     let _ = rl.load_history(&history_path);
 
-    println!(
-        "Connected to {}:{}. Type {} for commands.",
-        args.host,
-        args.port,
-        "help".bold()
-    );
+    if backend.is_local() {
+        println!(
+            "Opened {} (read-only). Type {} for commands.",
+            args.data_dir.as_ref().unwrap().display(),
+            "help".bold()
+        );
+    } else {
+        println!(
+            "Connected to {}:{}. Type {} for commands.",
+            args.host,
+            args.port,
+            "help".bold()
+        );
+    }
+
+    let prompt = if backend.is_local() {
+        "fluxdb (ro)> "
+    } else {
+        "fluxdb> "
+    };
 
     loop {
-        let readline = rl.readline("fluxdb> ");
+        let readline = rl.readline(prompt);
         match readline {
             Ok(line) => {
                 let trimmed = line.trim();
@@ -502,7 +622,7 @@ async fn run_repl(conn: &mut Connection, args: &CliArgs) {
                 match trimmed {
                     "exit" | "quit" => break,
                     "help" => {
-                        print_help();
+                        print_help(backend.is_local());
                         continue;
                     }
                     _ => {}
@@ -516,30 +636,35 @@ async fn run_repl(conn: &mut Connection, args: &CliArgs) {
                     }
                 };
 
-                match conn.send(&request).await {
+                match backend.execute(&request).await {
                     Ok(resp) => {
                         print!("{}", format_response(&resp, args.raw));
                     }
                     Err(e) => {
-                        eprintln!("{}", format!("Connection error: {e}").red().bold());
-                        eprintln!("Attempting to reconnect...");
-                        match Connection::connect(&args.host, args.port).await {
-                            Ok(mut new_conn) => {
-                                if let Some(ref token) = args.auth_token {
-                                    if let Err(e) = new_conn.authenticate(token).await {
-                                        eprintln!(
-                                            "{}",
-                                            format!("Re-auth failed: {e}").red().bold()
-                                        );
-                                        break;
+                        eprintln!("{}", format!("Error: {e}").red().bold());
+                        if !backend.is_local() {
+                            eprintln!("Attempting to reconnect...");
+                            match NetworkBackend::connect(&args.host, args.port).await {
+                                Ok(mut new_net) => {
+                                    if let Some(ref token) = args.auth_token {
+                                        if let Err(e) = new_net.authenticate(token).await {
+                                            eprintln!(
+                                                "{}",
+                                                format!("Re-auth failed: {e}").red().bold()
+                                            );
+                                            break;
+                                        }
                                     }
+                                    *backend = Backend::Network(new_net);
+                                    println!("{}", "Reconnected.".green());
                                 }
-                                *conn = new_conn;
-                                println!("{}", "Reconnected.".green());
-                            }
-                            Err(e) => {
-                                eprintln!("{}", format!("Reconnect failed: {e}").red().bold());
-                                break;
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        format!("Reconnect failed: {e}").red().bold()
+                                    );
+                                    break;
+                                }
                             }
                         }
                     }

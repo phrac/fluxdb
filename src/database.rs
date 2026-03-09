@@ -106,6 +106,36 @@ impl Database {
         Self::open_with_wal(data_dir, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES)
     }
 
+    /// Open a persistent database in read-only mode.
+    ///
+    /// Replays the WAL to rebuild in-memory state but does not open it for
+    /// writing. Safe to use while a server holds the same data directory.
+    #[cfg(feature = "persistence")]
+    pub fn open_readonly(data_dir: &Path) -> Result<Self> {
+        let name = data_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("fluxdb")
+            .to_string();
+
+        let wal_path = data_dir.join("wal.log");
+        let entries = Wal::read_all(&wal_path)?;
+        let collections = Self::replay_entries(&entries)?;
+
+        let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
+            .into_iter()
+            .map(|(name, col)| (name, Arc::new(RwLock::new(col))))
+            .collect();
+
+        Ok(Database {
+            name,
+            collections: RwLock::new(wrapped),
+            storage: Mutex::new(Box::new(MemoryBackend::new())),
+            max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
+            max_result_count: DEFAULT_MAX_RESULT_COUNT,
+        })
+    }
+
     /// Open or create a persistent database with custom WAL batch settings.
     #[cfg(feature = "persistence")]
     pub fn open_with_wal(
