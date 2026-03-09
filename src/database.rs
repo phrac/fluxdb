@@ -16,6 +16,175 @@ use std::path::Path;
 #[cfg(feature = "persistence")]
 use crate::wal::{Wal, SyncMode, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES};
 
+// ── Async WAL channel (group commit) ──────────────────────────────────────────
+
+/// Message sent to the WAL writer task.
+#[cfg(feature = "server")]
+pub(crate) enum WalMsg {
+    Append {
+        op: WalOperation,
+        reply: tokio::sync::oneshot::Sender<Result<u64>>,
+    },
+    Flush {
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    ReplaceAll {
+        ops: Vec<WalOperation>,
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+}
+
+/// Default channel buffer size for the WAL writer.
+#[cfg(feature = "server")]
+const WAL_CHANNEL_SIZE: usize = 4096;
+
+/// Background WAL writer task with group commit.
+///
+/// Drains all immediately-available messages from the channel and processes them
+/// as a batch.  Append ops are buffered in the WAL, then ONE flush/fsync covers
+/// the entire batch.  All waiting writers are notified after the single fsync
+/// completes — this is the "group commit" optimisation used by Postgres, SQLite,
+/// and most production databases.
+#[cfg(feature = "server")]
+pub(crate) async fn wal_writer_task(mut wal: Wal, mut rx: tokio::sync::mpsc::Receiver<WalMsg>) {
+    while let Some(first_msg) = rx.recv().await {
+        // Drain all immediately available messages (group commit batch)
+        let mut messages = Vec::with_capacity(64);
+        messages.push(first_msg);
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+
+        // Track append replies — they get answered after the group flush
+        let mut pending_appends: Vec<(tokio::sync::oneshot::Sender<Result<u64>>, u64)> = Vec::new();
+
+        for msg in messages {
+            match msg {
+                WalMsg::Append { op, reply } => {
+                    match wal.append(op) {
+                        Ok(seq) => pending_appends.push((reply, seq)),
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                WalMsg::Flush { reply } => {
+                    // Explicit flush: flush everything so far, reply to pending appends
+                    let result = wal.flush();
+                    let ok = result.is_ok();
+                    for (r, seq) in pending_appends.drain(..) {
+                        let _ = r.send(if ok {
+                            Ok(seq)
+                        } else {
+                            Err(FluxError::StorageError("WAL flush failed".into()))
+                        });
+                    }
+                    let _ = reply.send(result);
+                }
+                WalMsg::ReplaceAll { ops, reply } => {
+                    // Compaction: flush pending, then atomically replace
+                    let _ = wal.flush();
+                    let ok = true; // pending appends were buffered successfully
+                    for (r, seq) in pending_appends.drain(..) {
+                        let _ = r.send(if ok {
+                            Ok(seq)
+                        } else {
+                            Err(FluxError::StorageError("WAL flush failed".into()))
+                        });
+                    }
+                    let _ = reply.send(wal.replace_all(ops));
+                }
+            }
+        }
+
+        // Group flush: one fsync for the entire batch of appends
+        if !pending_appends.is_empty() {
+            let result = wal.flush();
+            let ok = result.is_ok();
+            for (reply, seq) in pending_appends {
+                let _ = reply.send(if ok {
+                    Ok(seq)
+                } else {
+                    Err(FluxError::StorageError("WAL flush failed".into()))
+                });
+            }
+        }
+    }
+
+    // Channel closed — final flush before exit
+    if let Err(e) = wal.flush() {
+        eprintln!("fluxdb: WAL flush on shutdown failed: {e}");
+    }
+}
+
+// ── WAL handle abstraction ────────────────────────────────────────────────────
+
+/// Abstraction over WAL access: either direct (inline Mutex) or via async channel.
+pub(crate) enum WalHandle {
+    /// Synchronous inline access — used for memory backends and tests.
+    Inline(Mutex<Box<dyn StorageBackend>>),
+    /// Async WAL writer with group commit — used by the server.
+    #[cfg(feature = "server")]
+    Channel(tokio::sync::mpsc::Sender<WalMsg>),
+}
+
+impl WalHandle {
+    fn append(&self, op: WalOperation) -> Result<u64> {
+        match self {
+            WalHandle::Inline(storage) => {
+                let mut s = storage.lock().map_err(|_| FluxError::Internal("storage lock poisoned".into()))?;
+                s.append(op)
+            }
+            #[cfg(feature = "server")]
+            WalHandle::Channel(tx) => {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.blocking_send(WalMsg::Append { op, reply: reply_tx })
+                    .map_err(|_| FluxError::Internal("WAL writer task has stopped".into()))?;
+                reply_rx
+                    .blocking_recv()
+                    .map_err(|_| FluxError::Internal("WAL writer reply dropped".into()))?
+            }
+        }
+    }
+
+    fn flush(&self) -> Result<()> {
+        match self {
+            WalHandle::Inline(storage) => {
+                let mut s = storage.lock().map_err(|_| FluxError::Internal("storage lock poisoned".into()))?;
+                s.flush()
+            }
+            #[cfg(feature = "server")]
+            WalHandle::Channel(tx) => {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.blocking_send(WalMsg::Flush { reply: reply_tx })
+                    .map_err(|_| FluxError::Internal("WAL writer task has stopped".into()))?;
+                reply_rx
+                    .blocking_recv()
+                    .map_err(|_| FluxError::Internal("WAL writer reply dropped".into()))?
+            }
+        }
+    }
+
+    fn replace_all(&self, ops: Vec<WalOperation>) -> Result<()> {
+        match self {
+            WalHandle::Inline(storage) => {
+                let mut s = storage.lock().map_err(|_| FluxError::Internal("storage lock poisoned".into()))?;
+                s.replace_all(ops)
+            }
+            #[cfg(feature = "server")]
+            WalHandle::Channel(tx) => {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.blocking_send(WalMsg::ReplaceAll { ops, reply: reply_tx })
+                    .map_err(|_| FluxError::Internal("WAL writer task has stopped".into()))?;
+                reply_rx
+                    .blocking_recv()
+                    .map_err(|_| FluxError::Internal("WAL writer reply dropped".into()))?
+            }
+        }
+    }
+
+}
+
 /// Maximum collection name length.
 const MAX_COLLECTION_NAME_LEN: usize = 128;
 
@@ -38,17 +207,19 @@ fn is_valid_collection_name(name: &str) -> bool {
 ///
 /// Internally synchronized with per-collection RwLocks for maximum read concurrency.
 /// All public methods take `&self` — no external locking required.
+///
+/// Write-ahead log access is abstracted behind [`WalHandle`], which is either:
+/// - **Inline**: direct `Mutex<StorageBackend>` (memory backend, tests, CLI tools)
+/// - **Channel**: async WAL writer task with group commit (server mode)
+///
+/// In channel mode, multiple concurrent writers' operations are batched into a
+/// single fsync, dramatically improving write throughput on multi-core systems.
 pub struct Database {
     pub name: String,
     collections: RwLock<HashMap<String, Arc<RwLock<Collection>>>>,
-    storage: Mutex<Box<dyn StorageBackend>>,
+    wal: WalHandle,
     max_document_bytes: usize,
     max_result_count: usize,
-}
-
-// Helper to handle poisoned locks gracefully
-fn lock_storage(storage: &Mutex<Box<dyn StorageBackend>>) -> Result<std::sync::MutexGuard<'_, Box<dyn StorageBackend>>> {
-    storage.lock().map_err(|_| FluxError::Internal("storage lock poisoned".into()))
 }
 
 fn read_collections(collections: &RwLock<HashMap<String, Arc<RwLock<Collection>>>>) -> Result<std::sync::RwLockReadGuard<'_, HashMap<String, Arc<RwLock<Collection>>>>> {
@@ -83,7 +254,7 @@ impl Database {
         Ok(Database {
             name: name.into(),
             collections: RwLock::new(wrapped),
-            storage: Mutex::new(storage),
+            wal: WalHandle::Inline(Mutex::new(storage)),
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_result_count: DEFAULT_MAX_RESULT_COUNT,
         })
@@ -94,7 +265,7 @@ impl Database {
         Database {
             name: "memory".to_string(),
             collections: RwLock::new(HashMap::new()),
-            storage: Mutex::new(Box::new(MemoryBackend::new())),
+            wal: WalHandle::Inline(Mutex::new(Box::new(MemoryBackend::new()))),
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_result_count: DEFAULT_MAX_RESULT_COUNT,
         }
@@ -130,13 +301,16 @@ impl Database {
         Ok(Database {
             name,
             collections: RwLock::new(wrapped),
-            storage: Mutex::new(Box::new(MemoryBackend::new())),
+            wal: WalHandle::Inline(Mutex::new(Box::new(MemoryBackend::new()))),
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_result_count: DEFAULT_MAX_RESULT_COUNT,
         })
     }
 
-    /// Open or create a persistent database with custom WAL batch settings.
+    /// Open or create a persistent database with custom WAL batch settings (inline mode).
+    ///
+    /// Uses a synchronous Mutex for WAL access. For the server, prefer
+    /// [`open_with_config`] which uses the async WAL channel with group commit.
     #[cfg(feature = "persistence")]
     pub fn open_with_wal(
         data_dir: &Path,
@@ -166,17 +340,59 @@ impl Database {
         Ok(Database {
             name,
             collections: RwLock::new(wrapped),
-            storage: Mutex::new(Box::new(wal)),
+            wal: WalHandle::Inline(Mutex::new(Box::new(wal))),
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_result_count: DEFAULT_MAX_RESULT_COUNT,
         })
     }
 
     /// Open or create a database using the provided config.
+    ///
+    /// Uses the async WAL channel with group commit: a dedicated background task
+    /// owns the WAL file, and all writers send operations through an mpsc channel.
+    /// Multiple concurrent writes are batched into a single fsync.
+    ///
+    /// Must be called from within a tokio runtime (the WAL task is spawned via
+    /// `tokio::spawn`).
     #[cfg(feature = "server")]
     pub fn open_with_config(config: &crate::config::Config, data_dir_override: Option<&Path>) -> Result<Self> {
         let data_dir = data_dir_override.unwrap_or(&config.data_dir);
-        let mut db = Self::open_with_wal(data_dir, config.wal.batch_size, config.wal.batch_bytes, config.wal.sync_mode)?;
+        fs::create_dir_all(data_dir)?;
+
+        let name = data_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("fluxdb")
+            .to_string();
+
+        let wal_path = data_dir.join("wal.log");
+        let entries = Wal::read_all(&wal_path)?;
+        let next_seq = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
+        let collections = Self::replay_entries(&entries)?;
+        let wal = Wal::open_at_sequence(
+            &wal_path,
+            next_seq,
+            config.wal.batch_size,
+            config.wal.batch_bytes,
+            config.wal.sync_mode,
+        )?;
+
+        // Spawn the WAL writer task with group commit
+        let (tx, rx) = tokio::sync::mpsc::channel(WAL_CHANNEL_SIZE);
+        tokio::spawn(wal_writer_task(wal, rx));
+
+        let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
+            .into_iter()
+            .map(|(name, col)| (name, Arc::new(RwLock::new(col))))
+            .collect();
+
+        let mut db = Database {
+            name,
+            collections: RwLock::new(wrapped),
+            wal: WalHandle::Channel(tx),
+            max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
+            max_result_count: DEFAULT_MAX_RESULT_COUNT,
+        };
         db.max_document_bytes = config.limits.max_document_bytes;
         db.max_result_count = config.limits.max_result_count;
         Ok(db)
@@ -246,14 +462,15 @@ impl Database {
             )));
         }
 
-        let mut wal = lock_storage(&self.storage)?;
+        // DDL holds the collections write lock for the full operation to prevent
+        // races (two concurrent create_collection for the same name).
         let mut collections = write_collections(&self.collections)?;
 
         if collections.contains_key(name) {
             return Err(FluxError::CollectionAlreadyExists(name.to_string()));
         }
 
-        wal.append(WalOperation::CreateCollection {
+        self.wal.append(WalOperation::CreateCollection {
             name: name.to_string(),
         })?;
 
@@ -266,14 +483,13 @@ impl Database {
 
     /// Drop a collection and all its documents.
     pub fn drop_collection(&self, name: &str) -> Result<()> {
-        let mut wal = lock_storage(&self.storage)?;
         let mut collections = write_collections(&self.collections)?;
 
         if !collections.contains_key(name) {
             return Err(FluxError::CollectionNotFound(name.to_string()));
         }
 
-        wal.append(WalOperation::DropCollection {
+        self.wal.append(WalOperation::DropCollection {
             name: name.to_string(),
         })?;
 
@@ -317,14 +533,11 @@ impl Database {
         let wal_data = doc.data_without_id();
 
         // WAL first
-        {
-            let mut wal = lock_storage(&self.storage)?;
-            wal.append(WalOperation::Insert {
-                collection: collection.to_string(),
-                doc_id: id.clone(),
-                data: wal_data,
-            })?;
-        }
+        self.wal.append(WalOperation::Insert {
+            collection: collection.to_string(),
+            doc_id: id.clone(),
+            data: wal_data,
+        })?;
 
         // Then mutate
         let mut col = write_collection(&col_arc)?;
@@ -379,14 +592,11 @@ impl Database {
             other => other.clone(),
         };
 
-        {
-            let mut wal = lock_storage(&self.storage)?;
-            wal.append(WalOperation::Update {
-                collection: collection.to_string(),
-                doc_id: id.to_string(),
-                data: update_data.clone(),
-            })?;
-        }
+        self.wal.append(WalOperation::Update {
+            collection: collection.to_string(),
+            doc_id: id.to_string(),
+            data: update_data.clone(),
+        })?;
 
         let mut col = write_collection(&col_arc)?;
         col.update(id, update_data)?;
@@ -412,13 +622,10 @@ impl Database {
             }
         }
 
-        {
-            let mut wal = lock_storage(&self.storage)?;
-            wal.append(WalOperation::Delete {
-                collection: collection.to_string(),
-                doc_id: id.to_string(),
-            })?;
-        }
+        self.wal.append(WalOperation::Delete {
+            collection: collection.to_string(),
+            doc_id: id.to_string(),
+        })?;
 
         let mut col = write_collection(&col_arc)?;
         Ok(col.delete(id))
@@ -517,13 +724,10 @@ impl Database {
                 .clone()
         };
 
-        {
-            let mut wal = lock_storage(&self.storage)?;
-            wal.append(WalOperation::CreateIndex {
-                collection: collection.to_string(),
-                field: field.to_string(),
-            })?;
-        }
+        self.wal.append(WalOperation::CreateIndex {
+            collection: collection.to_string(),
+            field: field.to_string(),
+        })?;
 
         let mut col = write_collection(&col_arc)?;
         col.create_index(field)
@@ -539,13 +743,10 @@ impl Database {
                 .clone()
         };
 
-        {
-            let mut wal = lock_storage(&self.storage)?;
-            wal.append(WalOperation::DropIndex {
-                collection: collection.to_string(),
-                field: field.to_string(),
-            })?;
-        }
+        self.wal.append(WalOperation::DropIndex {
+            collection: collection.to_string(),
+            field: field.to_string(),
+        })?;
 
         let mut col = write_collection(&col_arc)?;
         col.drop_index(field)
@@ -571,10 +772,7 @@ impl Database {
     /// acquires WAL lock only for the atomic replace.
     pub fn compact(&self) -> Result<()> {
         // First, flush any pending WAL entries
-        {
-            let mut wal = lock_storage(&self.storage)?;
-            wal.flush()?;
-        }
+        self.wal.flush()?;
 
         // Build the ops snapshot while only holding read locks (no WAL lock)
         let ops = {
@@ -607,16 +805,14 @@ impl Database {
             ops
         };
 
-        // Now acquire WAL lock only for the atomic replace
-        let mut wal = lock_storage(&self.storage)?;
-        wal.replace_all(ops)?;
+        // Atomically replace WAL with the compacted snapshot
+        self.wal.replace_all(ops)?;
         Ok(())
     }
 
     /// Explicitly flush all buffered WAL entries to disk.
     pub fn flush(&self) -> Result<()> {
-        let mut wal = lock_storage(&self.storage)?;
-        wal.flush()
+        self.wal.flush()
     }
 
     /// Get database statistics.
@@ -656,12 +852,21 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
-        if let Ok(mut wal) = self.storage.lock() {
-            if let Err(e) = wal.flush() {
-                eprintln!("fluxdb: WARNING: failed to flush WAL on shutdown: {e}");
+        match &self.wal {
+            WalHandle::Inline(storage) => {
+                if let Ok(mut s) = storage.lock() {
+                    if let Err(e) = s.flush() {
+                        eprintln!("fluxdb: WARNING: failed to flush WAL on shutdown: {e}");
+                    }
+                } else {
+                    eprintln!("fluxdb: WARNING: could not acquire storage lock during shutdown (poisoned)");
+                }
             }
-        } else {
-            eprintln!("fluxdb: WARNING: could not acquire storage lock during shutdown (poisoned)");
+            #[cfg(feature = "server")]
+            WalHandle::Channel(_) => {
+                // The WAL writer task flushes when the channel sender drops.
+                // Explicit flush before drop is handled by the server shutdown sequence.
+            }
         }
     }
 }

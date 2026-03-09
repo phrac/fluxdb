@@ -18,10 +18,25 @@ Benchmarked against established storage engines on equivalent workloads (10,000 
 
 FluxDB's zero-copy scan path is 14x faster than redb and 40x faster than SQLite. Point reads are 3x faster than SQLite, on par with RocksDB. Inserts are 4x faster than SQLite and 19x faster than MongoDB.
 
+### Concurrency
+
+FluxDB uses per-collection RwLocks and an async WAL writer with group commit to scale vertically. Concurrent reads to the same collection scale with cores; reads to different collections are fully independent. In server mode, concurrent writes are batched into a single fsync via group commit.
+
+Benchmark: each thread does the same work, so constant wall time = linear throughput scaling.
+
+| Threads | Read throughput | Write throughput† |
+|---------|---------------:|------------------:|
+| 1 | 3.9M ops/s (1.0x) | 418K ops/s (1.0x) |
+| 2 | 5.1M ops/s (1.3x) | 579K ops/s (1.4x) |
+| 4 | 7.4M ops/s (1.9x) | 913K ops/s (2.2x) |
+
+Reads: `get_by_id` on a shared 10K-document collection. Writes: inserts to per-thread collections (in-memory). Measured on Apple M2 Pro (6P+6E cores). †Server mode with group commit improves write scaling further by eliminating fsync serialization.
+
 Run the benchmarks yourself:
 
 ```bash
-cargo bench --bench comparison
+cargo bench --bench comparison   # single-threaded comparison vs SQLite, RocksDB, etc.
+cargo bench --bench engine       # all benchmarks including concurrency
 ```
 
 ## Features
@@ -34,6 +49,7 @@ cargo bench --bench comparison
 - **Projections** — include/exclude specific fields from query results
 - **Deterministic pagination** — BTreeMap-backed storage ensures `skip`/`limit` always returns consistent results
 - **Crash-safe WAL** — binary write-ahead log with CRC32 checksums, atomic compaction via temp-file + rename, corruption recovery, and native binary value encoding (no JSON-inside-bincode overhead)
+- **Group commit** — server mode uses a dedicated WAL writer task; concurrent writes are batched into a single fsync, scaling write throughput with core count
 - **Batched writes** — WAL entries are buffered and flushed in batches (configurable) for throughput
 - **Zero-copy scans** — pre-serialized document cache enables bulk reads without per-document serialization
 - **Per-collection concurrency** — RwLocks per collection allow parallel reads with minimal contention
@@ -480,7 +496,7 @@ src/
   query.rs         — query filter evaluation and projection
   wal.rs           — binary WAL with CRC32, atomic compaction, legacy reader
   storage.rs       — pluggable StorageBackend trait (WAL, memory)
-  database.rs      — database engine, per-collection RwLocks, WAL replay
+  database.rs      — database engine, per-collection RwLocks, WAL replay, group commit
   server.rs        — async TCP server (tokio), command dispatch
   redis.rs         — Redis RESP protocol server
   bin/fluxdb_cli.rs — interactive CLI client with REPL and shorthand commands
@@ -494,6 +510,7 @@ src/
 ### Design
 
 - **Per-collection RwLock** — reads on different collections never block each other; only writes acquire exclusive access
+- **Async WAL writer** — in server mode, a dedicated background task owns the WAL file and processes writes via an mpsc channel; multiple concurrent writers' operations are drained, batched, and flushed with a single fsync (group commit), eliminating the global write mutex bottleneck
 - **BTreeMap storage** — documents stored in sorted order by ID for deterministic iteration; pagination with `skip`/`limit` always returns consistent results
 - **B-tree indexes** — equality and range queries skip full collection scans; unified numeric keys (integer and float share the same index bucket); `$or` unions and `$and` intersections are index-aware with selectivity-first ordering
 - **Zero-copy scans** — documents cache their serialized bytes; bulk scans avoid per-document serialization

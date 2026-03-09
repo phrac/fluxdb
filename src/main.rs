@@ -156,10 +156,14 @@ async fn main() {
     // Signal all tasks to shut down
     let _ = shutdown_tx.send(());
 
-    // Flush WAL before exit
+    // Flush WAL before exit (uses spawn_blocking because db.flush() calls
+    // blocking_send on the WAL channel, which cannot run in an async context)
     eprintln!("Flushing WAL...");
-    if let Err(e) = db.flush() {
-        eprintln!("WARNING: Failed to flush WAL: {e}");
+    let flush_result = tokio::task::spawn_blocking(move || db.flush()).await;
+    match flush_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("WARNING: Failed to flush WAL: {e}"),
+        Err(e) => eprintln!("WARNING: WAL flush task panicked: {e}"),
     }
     eprintln!("Shutdown complete.");
 }

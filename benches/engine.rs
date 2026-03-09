@@ -1,4 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BatchSize};
+use std::sync::Arc;
+
+use criterion::{black_box, criterion_group, criterion_main, Criterion, BatchSize, BenchmarkId};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -228,6 +230,98 @@ fn bench_delete(c: &mut Criterion) {
     });
 }
 
+/// Concurrent reads from N threads (50K ops per thread, 10K-document collection).
+///
+/// Each thread does the SAME number of reads. If the per-collection RwLock
+/// scales, wall time stays roughly constant as threads increase, meaning total
+/// throughput scales linearly.
+fn bench_concurrent_reads(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_reads");
+    group.sample_size(10);
+
+    let db = Arc::new(Database::open_memory());
+    db.create_collection("bench").unwrap();
+    for i in 0..10_000 {
+        db.insert("bench", json!({"_id": format!("d{i}"), "n": i}))
+            .unwrap();
+    }
+
+    for threads in [1, 2, 4, 8] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{threads}t")),
+            &threads,
+            |b, &threads| {
+                b.iter(|| {
+                    let handles: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let db = Arc::clone(&db);
+                            std::thread::spawn(move || {
+                                for i in 0..50_000u64 {
+                                    let id = format!("d{}", (i + t as u64 * 1000) % 10_000);
+                                    black_box(db.get("bench", &id).unwrap());
+                                }
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Concurrent inserts from N threads — each thread writes to its OWN collection
+/// (in-memory, no WAL contention). Shows per-collection lock scaling.
+fn bench_concurrent_insert_memory(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_insert_mem");
+    group.sample_size(10);
+
+    for threads in [1, 2, 4, 8] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{threads}t")),
+            &threads,
+            |b, &threads| {
+                b.iter_batched(
+                    || {
+                        let db = Arc::new(Database::open_memory());
+                        for t in 0..threads {
+                            db.create_collection(&format!("col{t}")).unwrap();
+                        }
+                        db
+                    },
+                    |db| {
+                        let handles: Vec<_> = (0..threads)
+                            .map(|t| {
+                                let db = Arc::clone(&db);
+                                let col = format!("col{t}");
+                                std::thread::spawn(move || {
+                                    for i in 0..10_000 {
+                                        black_box(
+                                            db.insert(
+                                                &col,
+                                                json!({"t": t, "i": i, "data": "payload"}),
+                                            )
+                                            .unwrap(),
+                                        );
+                                    }
+                                })
+                            })
+                            .collect();
+                        for h in handles {
+                            h.join().unwrap();
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_persisted,
@@ -240,5 +334,7 @@ criterion_group!(
     bench_count_scan,
     bench_update,
     bench_delete,
+    bench_concurrent_reads,
+    bench_concurrent_insert_memory,
 );
 criterion_main!(benches);
