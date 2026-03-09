@@ -1,5 +1,7 @@
 # FluxDB
 
+> **Alpha software** — FluxDB is under active development. The on-disk data format (WAL) is not yet stable and may change between versions without a migration path. Do not use FluxDB for production data until the format is finalized (target: v1.0). Back up your data directory before upgrading.
+
 A fast, document-oriented NoSQL database written in Rust.
 
 FluxDB stores JSON documents in named collections, supports MongoDB-style queries with secondary index acceleration, and persists data using a crash-safe write-ahead log. It can run as a standalone TCP server, a Redis-compatible server, an embedded library, or in a distributed cluster.
@@ -31,7 +33,7 @@ cargo bench --bench comparison
 - **Secondary indexes** — B-tree indexes on arbitrary fields with type-unified numeric keys; `$or` and `$and` branches use indexes automatically with selectivity-first intersection
 - **Projections** — include/exclude specific fields from query results
 - **Deterministic pagination** — BTreeMap-backed storage ensures `skip`/`limit` always returns consistent results
-- **Crash-safe WAL** — binary write-ahead log with CRC32 checksums, atomic compaction via temp-file + rename, and corruption recovery
+- **Crash-safe WAL** — binary write-ahead log with CRC32 checksums, atomic compaction via temp-file + rename, corruption recovery, and native binary value encoding (no JSON-inside-bincode overhead)
 - **Batched writes** — WAL entries are buffered and flushed in batches (configurable) for throughput
 - **Zero-copy scans** — pre-serialized document cache enables bulk reads without per-document serialization
 - **Per-collection concurrency** — RwLocks per collection allow parallel reads with minimal contention

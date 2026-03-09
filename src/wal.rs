@@ -58,10 +58,96 @@ pub enum WalOperation {
     },
 }
 
-/// Bincode-friendly representation where Value fields are pre-serialized as JSON bytes.
+/// A bincode-friendly representation of a JSON value.
+///
+/// `serde_json::Value` uses `deserialize_any`, which bincode doesn't support
+/// (bincode is not self-describing). This type mirrors `Value` but with
+/// explicit variants that bincode can serialize/deserialize deterministically.
+#[cfg(feature = "persistence")]
+#[derive(Serialize, Deserialize)]
+enum BinValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Str(String),
+    Array(Vec<BinValue>),
+    Object(Vec<(String, BinValue)>),
+}
+
+#[cfg(feature = "persistence")]
+impl BinValue {
+    fn from_value(v: &Value) -> Self {
+        match v {
+            Value::Null => BinValue::Null,
+            Value::Bool(b) => BinValue::Bool(*b),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    BinValue::Int(i)
+                } else if let Some(u) = n.as_u64() {
+                    BinValue::UInt(u)
+                } else {
+                    BinValue::Float(n.as_f64().unwrap_or(0.0))
+                }
+            }
+            Value::String(s) => BinValue::Str(s.clone()),
+            Value::Array(arr) => BinValue::Array(arr.iter().map(BinValue::from_value).collect()),
+            Value::Object(map) => BinValue::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), BinValue::from_value(v)))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn into_value(self) -> Value {
+        match self {
+            BinValue::Null => Value::Null,
+            BinValue::Bool(b) => Value::Bool(b),
+            BinValue::Int(i) => Value::Number(i.into()),
+            BinValue::UInt(u) => Value::Number(u.into()),
+            BinValue::Float(f) => Value::Number(
+                serde_json::Number::from_f64(f).unwrap_or_else(|| 0i64.into()),
+            ),
+            BinValue::Str(s) => Value::String(s),
+            BinValue::Array(arr) => {
+                Value::Array(arr.into_iter().map(BinValue::into_value).collect())
+            }
+            BinValue::Object(pairs) => {
+                let map: serde_json::Map<String, Value> = pairs
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into_value()))
+                    .collect();
+                Value::Object(map)
+            }
+        }
+    }
+}
+
+/// Bincode-native representation — document data is stored as `BinValue`
+/// (a bincode-friendly mirror of `serde_json::Value`) instead of pre-serialized
+/// JSON bytes.
+///
+/// WAL format v2: eliminates the JSON-inside-bincode double-serialization.
+/// Legacy v1 WAL files are detected by attempting v2 deserialization first,
+/// then falling back to v1 on failure.
 #[cfg(feature = "persistence")]
 #[derive(Serialize, Deserialize)]
 enum BinWalOp {
+    CreateCollection { name: String },
+    DropCollection { name: String },
+    Insert { collection: String, doc_id: String, data: BinValue },
+    Update { collection: String, doc_id: String, data: BinValue },
+    Delete { collection: String, doc_id: String },
+    CreateIndex { collection: String, field: String },
+    DropIndex { collection: String, field: String },
+}
+
+/// Legacy v1 format where document data was pre-serialized as JSON bytes.
+#[cfg(feature = "persistence")]
+#[derive(Serialize, Deserialize)]
+enum BinWalOpV1 {
     CreateCollection { name: String },
     DropCollection { name: String },
     Insert { collection: String, doc_id: String, data_json: Vec<u8> },
@@ -73,8 +159,8 @@ enum BinWalOp {
 
 #[cfg(feature = "persistence")]
 impl BinWalOp {
-    fn from_op(op: &WalOperation) -> std::result::Result<Self, FluxError> {
-        Ok(match op {
+    fn from_op(op: &WalOperation) -> Self {
+        match op {
             WalOperation::CreateCollection { name } => {
                 BinWalOp::CreateCollection { name: name.clone() }
             }
@@ -85,14 +171,14 @@ impl BinWalOp {
                 BinWalOp::Insert {
                     collection: collection.clone(),
                     doc_id: doc_id.clone(),
-                    data_json: serde_json::to_vec(data)?,
+                    data: BinValue::from_value(data),
                 }
             }
             WalOperation::Update { collection, doc_id, data } => {
                 BinWalOp::Update {
                     collection: collection.clone(),
                     doc_id: doc_id.clone(),
-                    data_json: serde_json::to_vec(data)?,
+                    data: BinValue::from_value(data),
                 }
             }
             WalOperation::Delete { collection, doc_id } => {
@@ -104,26 +190,18 @@ impl BinWalOp {
             WalOperation::DropIndex { collection, field } => {
                 BinWalOp::DropIndex { collection: collection.clone(), field: field.clone() }
             }
-        })
+        }
     }
 
-    fn into_op(self) -> std::result::Result<WalOperation, FluxError> {
-        Ok(match self {
+    fn into_op(self) -> WalOperation {
+        match self {
             BinWalOp::CreateCollection { name } => WalOperation::CreateCollection { name },
             BinWalOp::DropCollection { name } => WalOperation::DropCollection { name },
-            BinWalOp::Insert { collection, doc_id, data_json } => {
-                WalOperation::Insert {
-                    collection,
-                    doc_id,
-                    data: serde_json::from_slice(&data_json)?,
-                }
+            BinWalOp::Insert { collection, doc_id, data } => {
+                WalOperation::Insert { collection, doc_id, data: data.into_value() }
             }
-            BinWalOp::Update { collection, doc_id, data_json } => {
-                WalOperation::Update {
-                    collection,
-                    doc_id,
-                    data: serde_json::from_slice(&data_json)?,
-                }
+            BinWalOp::Update { collection, doc_id, data } => {
+                WalOperation::Update { collection, doc_id, data: data.into_value() }
             }
             BinWalOp::Delete { collection, doc_id } => {
                 WalOperation::Delete { collection, doc_id }
@@ -132,6 +210,39 @@ impl BinWalOp {
                 WalOperation::CreateIndex { collection, field }
             }
             BinWalOp::DropIndex { collection, field } => {
+                WalOperation::DropIndex { collection, field }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "persistence")]
+impl BinWalOpV1 {
+    fn into_op(self) -> std::result::Result<WalOperation, FluxError> {
+        Ok(match self {
+            BinWalOpV1::CreateCollection { name } => WalOperation::CreateCollection { name },
+            BinWalOpV1::DropCollection { name } => WalOperation::DropCollection { name },
+            BinWalOpV1::Insert { collection, doc_id, data_json } => {
+                WalOperation::Insert {
+                    collection,
+                    doc_id,
+                    data: serde_json::from_slice(&data_json)?,
+                }
+            }
+            BinWalOpV1::Update { collection, doc_id, data_json } => {
+                WalOperation::Update {
+                    collection,
+                    doc_id,
+                    data: serde_json::from_slice(&data_json)?,
+                }
+            }
+            BinWalOpV1::Delete { collection, doc_id } => {
+                WalOperation::Delete { collection, doc_id }
+            }
+            BinWalOpV1::CreateIndex { collection, field } => {
+                WalOperation::CreateIndex { collection, field }
+            }
+            BinWalOpV1::DropIndex { collection, field } => {
                 WalOperation::DropIndex { collection, field }
             }
         })
@@ -209,7 +320,7 @@ impl Wal {
     pub fn append(&mut self, operation: WalOperation) -> Result<u64> {
         let seq = self.sequence;
 
-        let bin_op = BinWalOp::from_op(&operation)?;
+        let bin_op = BinWalOp::from_op(&operation);
         let op_bytes = bincode::serialize(&bin_op)
             .map_err(|e| FluxError::StorageError(format!("bincode serialize: {e}")))?;
 
@@ -304,13 +415,16 @@ impl Wal {
                 break;
             }
 
-            let bin_op: BinWalOp = match bincode::deserialize(op_bytes) {
-                Ok(op) => op,
-                Err(_) => break, // corrupted entry payload — stop here
-            };
-            let operation = match bin_op.into_op() {
-                Ok(op) => op,
-                Err(_) => break, // corrupted JSON data — stop here
+            // Try v2 (direct bincode Value) first, fall back to v1 (JSON-inside-bincode)
+            let operation = if let Ok(bin_op) = bincode::deserialize::<BinWalOp>(op_bytes) {
+                bin_op.into_op()
+            } else if let Ok(bin_op_v1) = bincode::deserialize::<BinWalOpV1>(op_bytes) {
+                match bin_op_v1.into_op() {
+                    Ok(op) => op,
+                    Err(_) => break, // corrupted JSON data — stop here
+                }
+            } else {
+                break; // corrupted entry payload — stop here
             };
 
             entries.push(WalEntry {
@@ -422,7 +536,7 @@ impl Wal {
         let mut buf = Vec::new();
         let mut seq = 0u64;
         for op in &ops {
-            let bin_op = BinWalOp::from_op(op)?;
+            let bin_op = BinWalOp::from_op(op);
             let op_bytes = bincode::serialize(&bin_op)
                 .map_err(|e| FluxError::StorageError(format!("bincode serialize: {e}")))?;
 
