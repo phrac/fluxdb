@@ -280,7 +280,7 @@ impl Default for ClusterConfig {
 }
 
 fn default_peer_listen() -> String {
-    "127.0.0.1:7655".to_string()
+    "127.0.0.1:5149".to_string()
 }
 
 fn default_health_check_interval_secs() -> u64 { 5 }
@@ -344,7 +344,7 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn default_listen() -> String {
-    "127.0.0.1:7654".to_string()
+    "127.0.0.1:5148".to_string()
 }
 
 fn default_wal_batch_size() -> usize {
@@ -656,8 +656,8 @@ impl Config {
             "# List all nodes in the cluster.\n\
              # [[cluster.nodes]]\n\
              # id = \"node-0\"\n\
-             # peer_addr = \"127.0.0.1:7655\"\n\
-             # client_addr = \"127.0.0.1:7654\"\n",
+             # peer_addr = \"127.0.0.1:5149\"\n\
+             # client_addr = \"127.0.0.1:5148\"\n",
         );
         out
     }

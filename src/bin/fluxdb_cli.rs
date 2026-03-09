@@ -28,7 +28,7 @@ struct CliArgs {
     host: String,
 
     /// Server port (network mode)
-    #[arg(short, long, default_value_t = 7654)]
+    #[arg(short, long, default_value_t = 5148)]
     port: u16,
 
     /// Execute a single command and exit (raw JSON or shorthand)

@@ -59,10 +59,10 @@ cargo bench --bench comparison
 docker compose up -d
 
 # Verify it's running
-echo '{"cmd":"stats"}' | nc localhost 7654
+echo '{"cmd":"stats"}' | nc localhost 5148
 ```
 
-This starts FluxDB with the JSON protocol on port 7654 and Redis protocol on port 6379. Data is persisted in a Docker volume.
+This starts FluxDB with the JSON protocol on port 5148 and Redis protocol on port 6379. Data is persisted in a Docker volume.
 
 To run a **3-node cluster**, edit `docker-compose.yml` — uncomment the cluster services and comment out the single-node service, then:
 
@@ -76,7 +76,7 @@ Pre-built cluster configs are in the `cluster/` directory using Docker networkin
 
 ```bash
 docker build -t fluxdb .
-docker run -d -p 7654:7654 -v fluxdb-data:/var/lib/fluxdb fluxdb
+docker run -d -p 5148:5148 -v fluxdb-data:/var/lib/fluxdb fluxdb
 ```
 
 ### From source
@@ -96,7 +96,7 @@ cargo build --release --features cli
 ./target/release/fluxdb --init-config fluxdb.toml
 ```
 
-Defaults to `./fluxdb_data` for data and `127.0.0.1:7654` for the JSON protocol.
+Defaults to `./fluxdb_data` for data and `127.0.0.1:5148` for the JSON protocol.
 
 ### Try it out
 
@@ -118,7 +118,7 @@ fluxdb-cli --cmd stats --raw | jq .
 fluxdb-cli --auth-token my-secret --cmd stats
 
 # Connect to a remote server
-fluxdb-cli -H 10.0.0.1 -p 7654
+fluxdb-cli -H 10.0.0.1 -p 5148
 
 # Open a data directory directly (read-only, no server needed)
 fluxdb-cli --data-dir ./fluxdb_data
@@ -150,7 +150,7 @@ cargo run --release -- --init-config fluxdb.toml
 data_dir = "./fluxdb_data"
 
 # Address and port for the JSON protocol server.
-listen = "127.0.0.1:7654"
+listen = "127.0.0.1:5148"
 
 [server]
 # Timeout for processing a single client request, in seconds (0 = disabled).
@@ -202,7 +202,7 @@ enabled = false
 # Unique identifier for this node.
 node_id = "node-0"
 # Address for peer-to-peer communication between nodes.
-peer_listen = "127.0.0.1:7655"
+peer_listen = "127.0.0.1:5149"
 # Seconds between health check pings to peer nodes.
 health_check_interval_secs = 5
 # Consecutive health check failures before marking a node unhealthy.
@@ -215,8 +215,8 @@ request_timeout_secs = 10
 # List all nodes in the cluster.
 [[cluster.nodes]]
 id = "node-0"
-peer_addr = "127.0.0.1:7655"
-client_addr = "127.0.0.1:7654"
+peer_addr = "127.0.0.1:5149"
+client_addr = "127.0.0.1:5148"
 ```
 
 #### CLI flags
@@ -380,22 +380,22 @@ Each node's TOML config lists every member of the cluster:
 [cluster]
 enabled = true
 node_id = "node-0"
-peer_listen = "10.0.0.1:7655"
+peer_listen = "10.0.0.1:5149"
 
 [[cluster.nodes]]
 id = "node-0"
-peer_addr = "10.0.0.1:7655"
-client_addr = "10.0.0.1:7654"
+peer_addr = "10.0.0.1:5149"
+client_addr = "10.0.0.1:5148"
 
 [[cluster.nodes]]
 id = "node-1"
-peer_addr = "10.0.0.2:7655"
-client_addr = "10.0.0.2:7654"
+peer_addr = "10.0.0.2:5149"
+client_addr = "10.0.0.2:5148"
 
 [[cluster.nodes]]
 id = "node-2"
-peer_addr = "10.0.0.3:7655"
-client_addr = "10.0.0.3:7654"
+peer_addr = "10.0.0.3:5149"
+client_addr = "10.0.0.3:5148"
 ```
 
 Clients connect to any node's `client_addr`. The cluster handles routing transparently.

@@ -3,11 +3,11 @@ services:
   fluxdb:
     build: .
     ports:
-      - "7654:7654"
+      - "5148:5148"
       - "6379:6379"
     volumes:
       - fluxdb-data:/var/lib/fluxdb
-    command: ["--listen", "0.0.0.0:7654", "--redis", "0.0.0.0:6379", "--data-dir", "/var/lib/fluxdb"]
+    command: ["--listen", "0.0.0.0:5148", "--redis", "0.0.0.0:6379", "--data-dir", "/var/lib/fluxdb"]
     restart: unless-stopped
 
   # ── 3-node cluster ──────────────────────────────────────────────────────────
@@ -17,7 +17,7 @@ services:
   # node0:
   #   build: .
   #   ports:
-  #     - "7654:7654"
+  #     - "5148:5148"
   #   volumes:
   #     - node0-data:/var/lib/fluxdb
   #     - ./cluster/node0.toml:/etc/fluxdb/fluxdb.toml:ro
@@ -27,7 +27,7 @@ services:
   # node1:
   #   build: .
   #   ports:
-  #     - "7664:7654"
+  #     - "5158:5148"
   #   volumes:
   #     - node1-data:/var/lib/fluxdb
   #     - ./cluster/node1.toml:/etc/fluxdb/fluxdb.toml:ro
@@ -37,7 +37,7 @@ services:
   # node2:
   #   build: .
   #   ports:
-  #     - "7674:7654"
+  #     - "5168:5148"
   #   volumes:
   #     - node2-data:/var/lib/fluxdb
   #     - ./cluster/node2.toml:/etc/fluxdb/fluxdb.toml:ro

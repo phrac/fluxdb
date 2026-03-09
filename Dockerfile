@@ -22,9 +22,9 @@ RUN mkdir -p /etc/fluxdb /var/lib/fluxdb && \
 USER fluxdb
 WORKDIR /var/lib/fluxdb
 
-EXPOSE 7654 6379 7655
+EXPOSE 5148 6379 5149
 
 VOLUME ["/var/lib/fluxdb"]
 
 ENTRYPOINT ["fluxdb"]
-CMD ["--listen", "0.0.0.0:7654", "--data-dir", "/var/lib/fluxdb"]
+CMD ["--listen", "0.0.0.0:5148", "--data-dir", "/var/lib/fluxdb"]
