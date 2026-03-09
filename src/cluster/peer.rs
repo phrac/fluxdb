@@ -7,9 +7,6 @@ use tokio::sync::Mutex;
 
 use crate::error::{FluxError, Result};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Client for communicating with a remote FluxDB node.
 ///
 /// Holds a persistent TCP connection (reconnects on failure).
@@ -17,6 +14,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct PeerClient {
     addr: String,
     conn: Mutex<Option<PeerConn>>,
+    connect_timeout: Duration,
+    request_timeout: Duration,
 }
 
 struct PeerConn {
@@ -25,10 +24,12 @@ struct PeerConn {
 }
 
 impl PeerClient {
-    pub fn new(addr: String) -> Self {
+    pub fn new(addr: String, connect_timeout_secs: u64, request_timeout_secs: u64) -> Self {
         PeerClient {
             addr,
             conn: Mutex::new(None),
+            connect_timeout: Duration::from_secs(connect_timeout_secs),
+            request_timeout: Duration::from_secs(request_timeout_secs),
         }
     }
 
@@ -76,7 +77,7 @@ impl PeerClient {
     }
 
     async fn connect(&self) -> Result<PeerConn> {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&self.addr))
+        let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(&self.addr))
             .await
             .map_err(|_| FluxError::NodeUnreachable(format!("{}: connect timeout", self.addr)))?
             .map_err(|e| FluxError::NodeUnreachable(format!("{}: {e}", self.addr)))?;
@@ -99,7 +100,7 @@ impl PeerClient {
             .map_err(|e| FluxError::NodeUnreachable(format!("{}: flush: {e}", self.addr)))?;
 
         let mut line = String::new();
-        tokio::time::timeout(REQUEST_TIMEOUT, conn.reader.read_line(&mut line))
+        tokio::time::timeout(self.request_timeout, conn.reader.read_line(&mut line))
             .await
             .map_err(|_| FluxError::NodeUnreachable(format!("{}: read timeout", self.addr)))?
             .map_err(|e| FluxError::NodeUnreachable(format!("{}: read: {e}", self.addr)))?;

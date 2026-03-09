@@ -37,8 +37,25 @@ async fn main() {
         "WAL batch:      {} entries / {} bytes",
         config.wal.batch_size, config.wal.batch_bytes
     );
+    let sync_mode_str = match config.wal.sync_mode {
+        fluxdb::wal::SyncMode::EveryFlush => "every_flush",
+        fluxdb::wal::SyncMode::None => "none",
+    };
+    eprintln!("WAL sync:       {}", sync_mode_str);
     if config.limits.max_connections > 0 {
         eprintln!("Max connections: {}", config.limits.max_connections);
+    }
+    if config.server.request_timeout_secs > 0 {
+        eprintln!("Request timeout: {}s", config.server.request_timeout_secs);
+    }
+    if config.server.idle_timeout_secs > 0 {
+        eprintln!("Idle timeout:    {}s", config.server.idle_timeout_secs);
+    }
+    if config.compaction.auto {
+        eprintln!("Auto-compaction: every {}s", config.compaction.interval_secs);
+    }
+    if config.log.slow_query_ms > 0 {
+        eprintln!("Slow query log:  {}ms", config.log.slow_query_ms);
     }
     if config.auth.enabled {
         eprintln!("Authentication: enabled");
@@ -87,6 +104,31 @@ async fn main() {
             );
             if let Err(e) = redis_server.run(&mut redis_shutdown).await {
                 eprintln!("Redis server error: {e}");
+            }
+        });
+    }
+
+    // Optionally start auto-compaction background task
+    if config.compaction.auto {
+        let compact_db = server.db();
+        let interval = std::time::Duration::from_secs(config.compaction.interval_secs);
+        let mut compact_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.tick().await; // skip first immediate tick
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let db = compact_db.clone();
+                        let result = tokio::task::spawn_blocking(move || db.compact()).await;
+                        match result {
+                            Ok(Ok(())) => eprintln!("fluxdb: auto-compaction completed"),
+                            Ok(Err(e)) => eprintln!("fluxdb: auto-compaction failed: {e}"),
+                            Err(e) => eprintln!("fluxdb: auto-compaction task panic: {e}"),
+                        }
+                    }
+                    _ = compact_shutdown.recv() => break,
+                }
             }
         });
     }

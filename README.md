@@ -152,11 +152,25 @@ data_dir = "./fluxdb_data"
 # Address and port for the JSON protocol server.
 listen = "127.0.0.1:7654"
 
-[auth]
-# Enable token-based authentication.
-enabled = false
-# Shared secret token (required when auth is enabled).
-token = ""
+[server]
+# Timeout for processing a single client request, in seconds (0 = disabled).
+request_timeout_secs = 0
+# Disconnect clients after this many seconds of inactivity (0 = disabled).
+idle_timeout_secs = 0
+
+[wal]
+# Number of WAL entries to buffer before flushing to disk.
+batch_size = 64
+# Byte threshold for the WAL write buffer before flushing.
+batch_bytes = 65536
+# When to fsync ("every_flush" = safest default, "none" = fastest).
+sync_mode = "every_flush"
+
+[compaction]
+# Enable automatic WAL compaction on a timer.
+auto = false
+# Interval between automatic compaction runs, in seconds (minimum 60).
+interval_secs = 3600
 
 [limits]
 # Maximum concurrent client connections (0 = unlimited).
@@ -166,11 +180,15 @@ max_document_bytes = 16777216
 # Maximum number of documents returned by a single query (default 100K).
 max_result_count = 100000
 
-[wal]
-# Number of WAL entries to buffer before flushing to disk.
-batch_size = 64
-# Byte threshold for the WAL write buffer before flushing.
-batch_bytes = 65536
+[auth]
+# Enable token-based authentication.
+enabled = false
+# Shared secret token (required when auth is enabled).
+token = ""
+
+[log]
+# Log queries that take longer than this many milliseconds (0 = disabled).
+slow_query_ms = 0
 
 [redis]
 # Enable Redis-compatible protocol server.
@@ -185,6 +203,14 @@ enabled = false
 node_id = "node-0"
 # Address for peer-to-peer communication between nodes.
 peer_listen = "127.0.0.1:7655"
+# Seconds between health check pings to peer nodes.
+health_check_interval_secs = 5
+# Consecutive health check failures before marking a node unhealthy.
+unhealthy_threshold = 3
+# Timeout in seconds for establishing a connection to a peer.
+connect_timeout_secs = 5
+# Timeout in seconds for a request/response cycle with a peer.
+request_timeout_secs = 10
 
 # List all nodes in the cluster.
 [[cluster.nodes]]

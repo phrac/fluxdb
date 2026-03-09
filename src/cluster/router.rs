@@ -36,7 +36,11 @@ impl ClusterRouter {
             if node.id != config.node_id {
                 peers.insert(
                     node.id.clone(),
-                    Arc::new(PeerClient::new(node.client_addr.clone())),
+                    Arc::new(PeerClient::new(
+                        node.client_addr.clone(),
+                        config.connect_timeout_secs,
+                        config.request_timeout_secs,
+                    )),
                 );
             }
         }

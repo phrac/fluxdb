@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,8 +16,15 @@ pub struct Server {
     max_connections: usize,
     auth_token: Option<String>,
     max_document_bytes: usize,
+    request_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    slow_query_ms: u64,
     #[cfg(feature = "cluster")]
     router: Option<Arc<crate::cluster::router::ClusterRouter>>,
+    #[cfg(feature = "cluster")]
+    cluster_health_check_interval_secs: u64,
+    #[cfg(feature = "cluster")]
+    cluster_unhealthy_threshold: u32,
 }
 
 impl Server {
@@ -41,14 +49,32 @@ impl Server {
             None
         };
 
+        let request_timeout = if config.server.request_timeout_secs > 0 {
+            Some(Duration::from_secs(config.server.request_timeout_secs))
+        } else {
+            None
+        };
+        let idle_timeout = if config.server.idle_timeout_secs > 0 {
+            Some(Duration::from_secs(config.server.idle_timeout_secs))
+        } else {
+            None
+        };
+
         Ok(Server {
             db,
             addr: config.listen.clone(),
             max_connections: config.limits.max_connections,
             auth_token,
             max_document_bytes: config.limits.max_document_bytes,
+            request_timeout,
+            idle_timeout,
+            slow_query_ms: config.log.slow_query_ms,
             #[cfg(feature = "cluster")]
             router,
+            #[cfg(feature = "cluster")]
+            cluster_health_check_interval_secs: config.cluster.health_check_interval_secs,
+            #[cfg(feature = "cluster")]
+            cluster_unhealthy_threshold: config.cluster.unhealthy_threshold,
         })
     }
 
@@ -71,7 +97,11 @@ impl Server {
     #[cfg(feature = "cluster")]
     pub fn start_health_checker(&self) {
         if let Some(ref router) = self.router {
-            let checker = crate::cluster::health::HealthChecker::new(router.peers().clone());
+            let checker = crate::cluster::health::HealthChecker::new(
+                router.peers().clone(),
+                self.cluster_health_check_interval_secs,
+                self.cluster_unhealthy_threshold,
+            );
             tokio::spawn(checker.run());
         }
     }
@@ -115,14 +145,17 @@ impl Server {
                     let db = Arc::clone(&self.db);
                     let auth_token = self.auth_token.clone();
                     let max_doc_bytes = self.max_document_bytes;
+                    let request_timeout = self.request_timeout;
+                    let idle_timeout = self.idle_timeout;
+                    let slow_query_ms = self.slow_query_ms;
                     #[cfg(feature = "cluster")]
                     let router = self.router.clone();
 
                     tokio::spawn(async move {
                         #[cfg(feature = "cluster")]
-                        let result = handle_client(stream, db, router, auth_token.as_deref(), max_doc_bytes).await;
+                        let result = handle_client(stream, db, router, auth_token.as_deref(), max_doc_bytes, request_timeout, idle_timeout, slow_query_ms).await;
                         #[cfg(not(feature = "cluster"))]
-                        let result = handle_client(stream, db, auth_token.as_deref(), max_doc_bytes).await;
+                        let result = handle_client(stream, db, auth_token.as_deref(), max_doc_bytes, request_timeout, idle_timeout, slow_query_ms).await;
                         if let Err(e) = result {
                             eprintln!("Client error: {e}");
                         }
@@ -146,12 +179,35 @@ async fn handle_client(
     #[cfg(feature = "cluster")] router: Option<Arc<crate::cluster::router::ClusterRouter>>,
     auth_token: Option<&str>,
     max_document_bytes: usize,
+    request_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    slow_query_ms: u64,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let mut authenticated = auth_token.is_none(); // If no auth required, start authenticated
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        // Wait for next line with optional idle timeout
+        let line = if let Some(timeout) = idle_timeout {
+            match tokio::time::timeout(timeout, lines.next_line()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let msg = json!({"ok": false, "error": "idle timeout"});
+                    let mut s = serde_json::to_string(&msg)?;
+                    s.push('\n');
+                    writer.write_all(s.as_bytes()).await?;
+                    writer.flush().await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            lines.next_line().await?
+        };
+        let line = match line {
+            Some(l) => l,
+            None => break,
+        };
         if line.is_empty() {
             continue;
         }
@@ -189,17 +245,28 @@ async fn handle_client(
                         json!({"ok": false, "error": "authentication required"})
                     }
                 } else {
-                    // In cluster mode: route unless the request is already routed to us
-                    #[cfg(feature = "cluster")]
-                    {
-                        let is_routed = request
-                            .get("_routed")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
+                    let cmd_name = request["cmd"].as_str().unwrap_or("?").to_string();
+                    let start = Instant::now();
 
-                        if !is_routed {
-                            if let Some(ref router) = router {
-                                router.route(&request).await
+                    let execute = async {
+                        #[cfg(feature = "cluster")]
+                        {
+                            let is_routed = request
+                                .get("_routed")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+
+                            if !is_routed {
+                                if let Some(ref router) = router {
+                                    router.route(&request).await
+                                } else {
+                                    let db = Arc::clone(&db);
+                                    tokio::task::spawn_blocking(move || process_command(&db, &request))
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            json!({"ok": false, "error": format!("internal error: {e}")})
+                                        })
+                                }
                             } else {
                                 let db = Arc::clone(&db);
                                 tokio::task::spawn_blocking(move || process_command(&db, &request))
@@ -208,8 +275,10 @@ async fn handle_client(
                                         json!({"ok": false, "error": format!("internal error: {e}")})
                                     })
                             }
-                        } else {
-                            // Already routed — execute locally
+                        }
+
+                        #[cfg(not(feature = "cluster"))]
+                        {
                             let db = Arc::clone(&db);
                             tokio::task::spawn_blocking(move || process_command(&db, &request))
                                 .await
@@ -217,17 +286,26 @@ async fn handle_client(
                                     json!({"ok": false, "error": format!("internal error: {e}")})
                                 })
                         }
+                    };
+
+                    let result = if let Some(timeout) = request_timeout {
+                        match tokio::time::timeout(timeout, execute).await {
+                            Ok(resp) => resp,
+                            Err(_) => json!({"ok": false, "error": "request timeout"}),
+                        }
+                    } else {
+                        execute.await
+                    };
+
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    if slow_query_ms > 0 && elapsed_ms >= slow_query_ms {
+                        eprintln!(
+                            "fluxdb: slow query: cmd={} elapsed={}ms",
+                            cmd_name, elapsed_ms
+                        );
                     }
 
-                    #[cfg(not(feature = "cluster"))]
-                    {
-                        let db = Arc::clone(&db);
-                        tokio::task::spawn_blocking(move || process_command(&db, &request))
-                            .await
-                            .unwrap_or_else(|e| {
-                                json!({"ok": false, "error": format!("internal error: {e}")})
-                            })
-                    }
+                    result
                 }
             }
             Err(e) => json!({"ok": false, "error": format!("invalid JSON: {e}")}),

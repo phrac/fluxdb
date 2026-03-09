@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+use crate::wal::SyncMode;
+
 /// FluxDB — a document-oriented NoSQL database.
 #[derive(Parser, Debug)]
 #[command(name = "fluxdb", version, about)]
@@ -51,7 +53,13 @@ pub struct Config {
     pub listen: String,
 
     #[serde(default)]
+    pub server: ServerConfig,
+
+    #[serde(default)]
     pub wal: WalConfig,
+
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 
     #[serde(default)]
     pub redis: RedisConfig,
@@ -64,6 +72,9 @@ pub struct Config {
 
     #[serde(default)]
     pub auth: AuthConfig,
+
+    #[serde(default)]
+    pub log: LogConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +105,66 @@ impl Default for AuthConfig {
         AuthConfig {
             enabled: false,
             token: String::new(),
+        }
+    }
+}
+
+/// Server connection handling tunables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// Timeout for processing a single client request, in seconds (0 = disabled).
+    #[serde(default)]
+    pub request_timeout_secs: u64,
+
+    /// Disconnect clients after this many seconds of inactivity (0 = disabled).
+    #[serde(default)]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            request_timeout_secs: 0,
+            idle_timeout_secs: 0,
+        }
+    }
+}
+
+/// Automatic WAL compaction settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// Enable automatic WAL compaction on a timer.
+    #[serde(default)]
+    pub auto: bool,
+
+    /// Interval between automatic compaction runs, in seconds.
+    #[serde(default = "default_compaction_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        CompactionConfig {
+            auto: false,
+            interval_secs: default_compaction_interval_secs(),
+        }
+    }
+}
+
+fn default_compaction_interval_secs() -> u64 { 3600 }
+
+/// Logging and diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    /// Log queries that take longer than this many milliseconds (0 = disabled).
+    #[serde(default)]
+    pub slow_query_ms: u64,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        LogConfig {
+            slow_query_ms: 0,
         }
     }
 }
@@ -164,6 +235,22 @@ pub struct ClusterConfig {
     /// All nodes in the cluster.
     #[serde(default)]
     pub nodes: Vec<NodeConfig>,
+
+    /// Seconds between health check pings to peer nodes.
+    #[serde(default = "default_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
+
+    /// Consecutive health check failures before marking a node unhealthy.
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
+
+    /// Timeout in seconds for establishing a connection to a peer node.
+    #[serde(default = "default_peer_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+
+    /// Timeout in seconds for a request/response cycle with a peer node.
+    #[serde(default = "default_peer_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 /// A single node in the cluster.
@@ -184,6 +271,10 @@ impl Default for ClusterConfig {
             node_id: String::new(),
             peer_listen: default_peer_listen(),
             nodes: Vec::new(),
+            health_check_interval_secs: default_health_check_interval_secs(),
+            unhealthy_threshold: default_unhealthy_threshold(),
+            connect_timeout_secs: default_peer_connect_timeout_secs(),
+            request_timeout_secs: default_peer_request_timeout_secs(),
         }
     }
 }
@@ -191,6 +282,11 @@ impl Default for ClusterConfig {
 fn default_peer_listen() -> String {
     "127.0.0.1:7655".to_string()
 }
+
+fn default_health_check_interval_secs() -> u64 { 5 }
+fn default_unhealthy_threshold() -> u32 { 3 }
+fn default_peer_connect_timeout_secs() -> u64 { 5 }
+fn default_peer_request_timeout_secs() -> u64 { 10 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalConfig {
@@ -201,6 +297,10 @@ pub struct WalConfig {
     /// Byte threshold for the WAL buffer before flushing.
     #[serde(default = "default_wal_batch_bytes")]
     pub batch_bytes: usize,
+
+    /// When to fsync the WAL file ("every_flush" or "none").
+    #[serde(default)]
+    pub sync_mode: SyncMode,
 }
 
 impl Default for Config {
@@ -208,11 +308,14 @@ impl Default for Config {
         Config {
             data_dir: default_data_dir(),
             listen: default_listen(),
+            server: ServerConfig::default(),
             wal: WalConfig::default(),
+            compaction: CompactionConfig::default(),
             redis: RedisConfig::default(),
             cluster: ClusterConfig::default(),
             limits: LimitsConfig::default(),
             auth: AuthConfig::default(),
+            log: LogConfig::default(),
         }
     }
 }
@@ -231,6 +334,7 @@ impl Default for WalConfig {
         WalConfig {
             batch_size: default_wal_batch_size(),
             batch_bytes: default_wal_batch_bytes(),
+            sync_mode: SyncMode::default(),
         }
     }
 }
@@ -324,6 +428,11 @@ impl Config {
             return Err("wal.batch_bytes must be <= 256MB".into());
         }
 
+        // Validate compaction settings
+        if self.compaction.auto && self.compaction.interval_secs < 60 {
+            return Err("compaction.interval_secs must be >= 60 when auto is enabled".into());
+        }
+
         // Validate limits
         if self.limits.max_document_bytes == 0 {
             return Err("limits.max_document_bytes must be > 0".into());
@@ -362,6 +471,18 @@ impl Config {
                     self.cluster.node_id
                 ));
             }
+            if self.cluster.health_check_interval_secs == 0 {
+                return Err("cluster.health_check_interval_secs must be > 0".into());
+            }
+            if self.cluster.unhealthy_threshold == 0 {
+                return Err("cluster.unhealthy_threshold must be > 0".into());
+            }
+            if self.cluster.connect_timeout_secs == 0 {
+                return Err("cluster.connect_timeout_secs must be > 0".into());
+            }
+            if self.cluster.request_timeout_secs == 0 {
+                return Err("cluster.request_timeout_secs must be > 0".into());
+            }
         }
 
         // Auth validation
@@ -389,6 +510,11 @@ impl Config {
 
     /// Serialize to TOML with comments.
     pub fn to_toml_string(&self) -> String {
+        let sync_mode_str = match self.wal.sync_mode {
+            SyncMode::EveryFlush => "every_flush",
+            SyncMode::None => "none",
+        };
+
         let mut out = String::new();
         out.push_str("# FluxDB configuration\n\n");
         out.push_str(&format!(
@@ -401,6 +527,19 @@ impl Config {
              listen = {:?}\n\n",
             self.listen
         ));
+
+        out.push_str("[server]\n");
+        out.push_str(&format!(
+            "# Timeout for processing a single client request, in seconds (0 = disabled).\n\
+             request_timeout_secs = {}\n\n",
+            self.server.request_timeout_secs
+        ));
+        out.push_str(&format!(
+            "# Disconnect clients after this many seconds of inactivity (0 = disabled).\n\
+             idle_timeout_secs = {}\n\n",
+            self.server.idle_timeout_secs
+        ));
+
         out.push_str("[wal]\n");
         out.push_str(&format!(
             "# Number of WAL entries to buffer before flushing to disk.\n\
@@ -412,6 +551,24 @@ impl Config {
              batch_bytes = {}\n\n",
             self.wal.batch_bytes
         ));
+        out.push_str(&format!(
+            "# When to fsync the WAL (\"every_flush\" = safest, \"none\" = fastest).\n\
+             sync_mode = {:?}\n\n",
+            sync_mode_str
+        ));
+
+        out.push_str("[compaction]\n");
+        out.push_str(&format!(
+            "# Enable automatic WAL compaction on a timer.\n\
+             auto = {}\n\n",
+            self.compaction.auto
+        ));
+        out.push_str(&format!(
+            "# Interval between automatic compaction runs, in seconds.\n\
+             interval_secs = {}\n\n",
+            self.compaction.interval_secs
+        ));
+
         out.push_str("[redis]\n");
         out.push_str(&format!(
             "# Enable Redis-compatible protocol server.\n\
@@ -423,6 +580,7 @@ impl Config {
              listen = {:?}\n\n",
             self.redis.listen
         ));
+
         out.push_str("[limits]\n");
         out.push_str(&format!(
             "# Maximum concurrent client connections (0 = unlimited).\n\
@@ -439,6 +597,7 @@ impl Config {
              max_result_count = {}\n\n",
             self.limits.max_result_count
         ));
+
         out.push_str("[auth]\n");
         out.push_str(&format!(
             "# Require token authentication for connections.\n\
@@ -449,6 +608,14 @@ impl Config {
             "# Shared secret token.\n\
              # token = \"your-secret-token-here\"\n\n",
         );
+
+        out.push_str("[log]\n");
+        out.push_str(&format!(
+            "# Log queries that take longer than this many milliseconds (0 = disabled).\n\
+             slow_query_ms = {}\n\n",
+            self.log.slow_query_ms
+        ));
+
         out.push_str("[cluster]\n");
         out.push_str(&format!(
             "# Enable distributed cluster mode.\n\
@@ -464,6 +631,26 @@ impl Config {
             "# Address for peer-to-peer communication between nodes.\n\
              peer_listen = {:?}\n\n",
             self.cluster.peer_listen
+        ));
+        out.push_str(&format!(
+            "# Seconds between health check pings to peer nodes.\n\
+             health_check_interval_secs = {}\n\n",
+            self.cluster.health_check_interval_secs
+        ));
+        out.push_str(&format!(
+            "# Consecutive health check failures before marking a node unhealthy.\n\
+             unhealthy_threshold = {}\n\n",
+            self.cluster.unhealthy_threshold
+        ));
+        out.push_str(&format!(
+            "# Timeout in seconds for establishing a connection to a peer.\n\
+             connect_timeout_secs = {}\n\n",
+            self.cluster.connect_timeout_secs
+        ));
+        out.push_str(&format!(
+            "# Timeout in seconds for a request/response cycle with a peer.\n\
+             request_timeout_secs = {}\n\n",
+            self.cluster.request_timeout_secs
         ));
         out.push_str(
             "# List all nodes in the cluster.\n\

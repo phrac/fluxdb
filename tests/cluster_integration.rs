@@ -32,6 +32,7 @@ fn make_cluster_config(node_id: &str) -> (ClusterConfig, Vec<NodeConfig>) {
         node_id: node_id.into(),
         peer_listen: "unused".into(),
         nodes: nodes.clone(),
+        ..ClusterConfig::default()
     };
 
     (config, nodes)

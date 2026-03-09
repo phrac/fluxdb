@@ -6,13 +6,12 @@ use tokio::sync::RwLock;
 
 use crate::cluster::peer::PeerClient;
 
-const HEALTH_INTERVAL: Duration = Duration::from_secs(5);
-const UNHEALTHY_THRESHOLD: u32 = 3;
-
 /// Tracks the health of all peer nodes.
 pub struct HealthChecker {
     peers: HashMap<String, Arc<PeerClient>>,
     status: Arc<RwLock<HashMap<String, NodeStatus>>>,
+    health_interval: Duration,
+    unhealthy_threshold: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -23,7 +22,11 @@ pub struct NodeStatus {
 }
 
 impl HealthChecker {
-    pub fn new(peers: HashMap<String, Arc<PeerClient>>) -> Self {
+    pub fn new(
+        peers: HashMap<String, Arc<PeerClient>>,
+        health_check_interval_secs: u64,
+        unhealthy_threshold: u32,
+    ) -> Self {
         let mut status = HashMap::new();
         for node_id in peers.keys() {
             status.insert(
@@ -39,6 +42,8 @@ impl HealthChecker {
         HealthChecker {
             peers,
             status: Arc::new(RwLock::new(status)),
+            health_interval: Duration::from_secs(health_check_interval_secs),
+            unhealthy_threshold,
         }
     }
 
@@ -75,7 +80,7 @@ impl HealthChecker {
                             s.consecutive_failures = 0;
                         } else {
                             s.consecutive_failures += 1;
-                            if s.consecutive_failures >= UNHEALTHY_THRESHOLD {
+                            if s.consecutive_failures >= self.unhealthy_threshold {
                                 if s.healthy {
                                     eprintln!("fluxdb: node {node_id} marked unhealthy after {} failures", s.consecutive_failures);
                                 }
@@ -85,7 +90,7 @@ impl HealthChecker {
                     }
                 }
             }
-            tokio::time::sleep(HEALTH_INTERVAL).await;
+            tokio::time::sleep(self.health_interval).await;
         }
     }
 }

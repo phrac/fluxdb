@@ -14,7 +14,7 @@ use std::fs;
 #[cfg(feature = "persistence")]
 use std::path::Path;
 #[cfg(feature = "persistence")]
-use crate::wal::{Wal, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES};
+use crate::wal::{Wal, SyncMode, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES};
 
 /// Maximum collection name length.
 const MAX_COLLECTION_NAME_LEN: usize = 128;
@@ -103,7 +103,7 @@ impl Database {
     /// Open or create a persistent database at the given path with default settings.
     #[cfg(feature = "persistence")]
     pub fn open(data_dir: &Path) -> Result<Self> {
-        Self::open_with_wal(data_dir, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES)
+        Self::open_with_wal(data_dir, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES, SyncMode::default())
     }
 
     /// Open a persistent database in read-only mode.
@@ -142,6 +142,7 @@ impl Database {
         data_dir: &Path,
         wal_batch_size: usize,
         wal_batch_bytes: usize,
+        sync_mode: SyncMode,
     ) -> Result<Self> {
         fs::create_dir_all(data_dir)?;
 
@@ -155,7 +156,7 @@ impl Database {
         let entries = Wal::read_all(&wal_path)?;
         let next_seq = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
         let collections = Self::replay_entries(&entries)?;
-        let wal = Wal::open_at_sequence(&wal_path, next_seq, wal_batch_size, wal_batch_bytes)?;
+        let wal = Wal::open_at_sequence(&wal_path, next_seq, wal_batch_size, wal_batch_bytes, sync_mode)?;
 
         let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
             .into_iter()
@@ -175,7 +176,7 @@ impl Database {
     #[cfg(feature = "server")]
     pub fn open_with_config(config: &crate::config::Config, data_dir_override: Option<&Path>) -> Result<Self> {
         let data_dir = data_dir_override.unwrap_or(&config.data_dir);
-        let mut db = Self::open_with_wal(data_dir, config.wal.batch_size, config.wal.batch_bytes)?;
+        let mut db = Self::open_with_wal(data_dir, config.wal.batch_size, config.wal.batch_bytes, config.wal.sync_mode)?;
         db.max_document_bytes = config.limits.max_document_bytes;
         db.max_result_count = config.limits.max_result_count;
         Ok(db)

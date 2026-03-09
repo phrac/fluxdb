@@ -17,6 +17,22 @@ use crate::storage::StorageBackend;
 pub const DEFAULT_BATCH_SIZE: usize = 64;
 pub const DEFAULT_BATCH_BYTES: usize = 64 * 1024;
 
+/// Controls when the WAL calls fsync after flushing buffered writes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMode {
+    /// fsync after every batch flush (safest, default).
+    EveryFlush,
+    /// No fsync — rely on OS page cache (fastest, risk of data loss on crash).
+    None,
+}
+
+impl Default for SyncMode {
+    fn default() -> Self {
+        SyncMode::EveryFlush
+    }
+}
+
 /// A WAL entry representing a single mutation.
 #[derive(Clone)]
 pub struct WalEntry {
@@ -265,20 +281,22 @@ pub struct Wal {
     pending_count: usize,
     batch_size: usize,
     batch_bytes: usize,
+    sync_mode: SyncMode,
 }
 
 #[cfg(feature = "persistence")]
 impl Wal {
     /// Open or create a WAL file with default batch settings.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_config(path, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES)
+        Self::open_with_params(path, DEFAULT_BATCH_SIZE, DEFAULT_BATCH_BYTES, SyncMode::default())
     }
 
-    /// Open or create a WAL file with custom batch settings.
-    pub fn open_with_config(
+    /// Open or create a WAL file with custom batch and sync settings.
+    pub fn open_with_params(
         path: &Path,
         batch_size: usize,
         batch_bytes: usize,
+        sync_mode: SyncMode,
     ) -> Result<Self> {
         let entries = if path.exists() {
             Self::read_all(path)?
@@ -286,7 +304,7 @@ impl Wal {
             Vec::new()
         };
         let sequence = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
-        Self::open_at_sequence(path, sequence, batch_size, batch_bytes)
+        Self::open_at_sequence(path, sequence, batch_size, batch_bytes, sync_mode)
     }
 
     /// Open a WAL file starting at a known sequence number (avoids re-reading entries).
@@ -295,6 +313,7 @@ impl Wal {
         sequence: u64,
         batch_size: usize,
         batch_bytes: usize,
+        sync_mode: SyncMode,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -313,6 +332,7 @@ impl Wal {
             pending_count: 0,
             batch_size,
             batch_bytes,
+            sync_mode,
         })
     }
 
@@ -357,7 +377,9 @@ impl Wal {
             return Ok(());
         }
         self.file.write_all(&self.buffer)?;
-        self.file.sync_data()?;
+        if self.sync_mode == SyncMode::EveryFlush {
+            self.file.sync_data()?;
+        }
         self.buffer.clear();
         self.pending_count = 0;
         Ok(())
