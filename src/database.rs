@@ -398,6 +398,12 @@ impl Database {
         Ok(db)
     }
 
+    /// Set the maximum number of documents returned by `find` / `find_raw`.
+    /// Useful for local/read-only workloads that need more than the default 100k cap.
+    pub fn set_max_result_count(&mut self, limit: usize) {
+        self.max_result_count = limit;
+    }
+
     fn replay_entries(entries: &[WalEntry]) -> Result<HashMap<String, Collection>> {
         let mut collections: HashMap<String, Collection> = HashMap::new();
 
