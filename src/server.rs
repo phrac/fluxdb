@@ -422,6 +422,18 @@ pub fn process_command(db: &Database, request: &Value) -> Value {
             }
         }
 
+        "delete_many" => {
+            let collection = match request["collection"].as_str() {
+                Some(c) => c,
+                None => return json!({"ok": false, "error": "missing 'collection' field"}),
+            };
+            let filter = request.get("filter").cloned().unwrap_or(json!({}));
+            match db.delete_many(collection, filter) {
+                Ok(count) => json!({"ok": true, "deleted": count}),
+                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            }
+        }
+
         "find" => {
             let collection = match request["collection"].as_str() {
                 Some(c) => c,

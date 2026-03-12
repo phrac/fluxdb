@@ -96,6 +96,30 @@ impl Collection {
         true
     }
 
+    /// Return the IDs of all documents matching a filter.
+    pub fn find_matching_ids(&self, filter: &Value) -> Result<Vec<String>> {
+        let is_match_all = filter.as_object().map_or(false, |m| m.is_empty());
+
+        let candidate_ids = if is_match_all {
+            None
+        } else {
+            self.try_index_scan(filter)
+        };
+
+        let iter: Box<dyn Iterator<Item = &Document>> = match &candidate_ids {
+            Some(ids) => Box::new(ids.iter().filter_map(|id| self.documents.get(id))),
+            None => Box::new(self.documents.values()),
+        };
+
+        let mut ids = Vec::new();
+        for doc in iter {
+            if is_match_all || matches_filter(doc, filter)? {
+                ids.push(doc.id.clone());
+            }
+        }
+        Ok(ids)
+    }
+
     /// Find all documents matching a filter, with optional projection and sort.
     /// Uses secondary indexes when possible to narrow the scan.
     pub fn find(

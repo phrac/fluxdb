@@ -101,6 +101,7 @@ impl ClusterRouter {
             "insert" => self.route_insert(request).await,
 
             // Scatter-gather — fan out to all nodes
+            "delete_many" => self.scatter_delete_many(request).await,
             "find" => self.scatter_find(request).await,
             "count" => self.scatter_count(request).await,
             "list_collections" => self.scatter_list_collections(request).await,
@@ -229,6 +230,16 @@ impl ClusterRouter {
             .filter_map(|r| r.get("count").and_then(|c| c.as_u64()))
             .sum();
         json!({"ok": true, "count": total})
+    }
+
+    /// Scatter delete_many and sum the deleted counts.
+    async fn scatter_delete_many(&self, request: &Value) -> Value {
+        let responses = self.scatter(request).await;
+        let total: u64 = responses
+            .iter()
+            .filter_map(|r| r.get("deleted").and_then(|c| c.as_u64()))
+            .sum();
+        json!({"ok": true, "deleted": total})
     }
 
     /// Scatter list_collections and union the results.

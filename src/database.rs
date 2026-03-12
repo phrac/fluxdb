@@ -637,6 +637,40 @@ impl Database {
         Ok(col.delete(id))
     }
 
+    /// Delete all documents matching a filter. Returns the number deleted.
+    pub fn delete_many(&self, collection: &str, filter: Value) -> Result<usize> {
+        let col_arc = {
+            let collections = read_collections(&self.collections)?;
+            collections
+                .get(collection)
+                .ok_or_else(|| FluxError::CollectionNotFound(collection.to_string()))?
+                .clone()
+        };
+
+        // Collect matching IDs under a read lock
+        let ids = {
+            let col = read_collection(&col_arc)?;
+            col.find_matching_ids(&filter)?
+        };
+
+        // WAL-log and delete each
+        for id in &ids {
+            self.wal.append(WalOperation::Delete {
+                collection: collection.to_string(),
+                doc_id: id.clone(),
+            })?;
+        }
+
+        let mut col = write_collection(&col_arc)?;
+        let mut count = 0;
+        for id in &ids {
+            if col.delete(id) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Find documents matching a filter.
     pub fn find(
         &self,
@@ -966,6 +1000,31 @@ mod tests {
         assert!(db.delete("users", &id).unwrap());
         assert!(!db.delete("users", &id).unwrap());
         assert!(db.get("users", &id).is_err());
+    }
+
+    #[test]
+    fn test_delete_many() {
+        let (db, _dir) = test_db();
+        db.create_collection("users").unwrap();
+        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
+        db.insert("users", json!({"name": "Bob", "age": 25})).unwrap();
+        db.insert("users", json!({"name": "Charlie", "age": 30})).unwrap();
+        db.insert("users", json!({"name": "Dave", "age": 40})).unwrap();
+
+        // Delete all users with age 30
+        let deleted = db.delete_many("users", json!({"age": 30})).unwrap();
+        assert_eq!(deleted, 2);
+
+        // Only Bob and Dave remain
+        let remaining = db.find("users", json!({}), None, None, None, None).unwrap();
+        assert_eq!(remaining.len(), 2);
+
+        // Delete with empty filter removes all
+        let deleted = db.delete_many("users", json!({})).unwrap();
+        assert_eq!(deleted, 2);
+
+        let remaining = db.find("users", json!({}), None, None, None, None).unwrap();
+        assert_eq!(remaining.len(), 0);
     }
 
     #[test]
