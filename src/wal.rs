@@ -282,6 +282,7 @@ pub struct Wal {
     batch_size: usize,
     batch_bytes: usize,
     sync_mode: SyncMode,
+    file_bytes: u64,
 }
 
 #[cfg(feature = "persistence")]
@@ -324,6 +325,8 @@ impl Wal {
             .append(true)
             .open(path)?;
 
+        let file_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+
         Ok(Wal {
             path: path.to_path_buf(),
             file,
@@ -333,6 +336,7 @@ impl Wal {
             batch_size,
             batch_bytes,
             sync_mode,
+            file_bytes,
         })
     }
 
@@ -380,9 +384,15 @@ impl Wal {
         if self.sync_mode == SyncMode::EveryFlush {
             self.file.sync_data()?;
         }
+        self.file_bytes += self.buffer.len() as u64;
         self.buffer.clear();
         self.pending_count = 0;
         Ok(())
+    }
+
+    /// Current WAL file size in bytes (tracked, not stat'd).
+    pub fn file_bytes(&self) -> u64 {
+        self.file_bytes
     }
 
     /// Read all valid entries from a WAL file. Detects binary vs legacy JSON format.
@@ -593,6 +603,7 @@ impl Wal {
             .append(true)
             .open(&self.path)?;
         self.sequence = seq;
+        self.file_bytes = buf.len() as u64;
         self.buffer.clear();
         self.pending_count = 0;
 

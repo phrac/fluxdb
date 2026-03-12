@@ -46,7 +46,12 @@ const WAL_CHANNEL_SIZE: usize = 4096;
 /// completes — this is the "group commit" optimisation used by Postgres, SQLite,
 /// and most production databases.
 #[cfg(feature = "server")]
-pub(crate) async fn wal_writer_task(mut wal: Wal, mut rx: tokio::sync::mpsc::Receiver<WalMsg>) {
+pub(crate) async fn wal_writer_task(
+    mut wal: Wal,
+    mut rx: tokio::sync::mpsc::Receiver<WalMsg>,
+    max_wal_bytes: u64,
+    compact_notify: std::sync::Arc<tokio::sync::Notify>,
+) {
     while let Some(first_msg) = rx.recv().await {
         // Drain all immediately available messages (group commit batch)
         let mut messages = Vec::with_capacity(64);
@@ -108,6 +113,11 @@ pub(crate) async fn wal_writer_task(mut wal: Wal, mut rx: tokio::sync::mpsc::Rec
                     Err(FluxError::StorageError("WAL flush failed".into()))
                 });
             }
+        }
+
+        // Signal compaction if WAL exceeds size threshold
+        if max_wal_bytes > 0 && wal.file_bytes() > max_wal_bytes {
+            compact_notify.notify_one();
         }
     }
 
@@ -220,6 +230,9 @@ pub struct Database {
     wal: WalHandle,
     max_document_bytes: usize,
     max_result_count: usize,
+    /// Notified when WAL size exceeds the configured threshold.
+    #[cfg(feature = "server")]
+    compact_notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 fn read_collections(collections: &RwLock<HashMap<String, Arc<RwLock<Collection>>>>) -> Result<std::sync::RwLockReadGuard<'_, HashMap<String, Arc<RwLock<Collection>>>>> {
@@ -257,6 +270,8 @@ impl Database {
             wal: WalHandle::Inline(Mutex::new(storage)),
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_result_count: DEFAULT_MAX_RESULT_COUNT,
+            #[cfg(feature = "server")]
+            compact_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -268,6 +283,8 @@ impl Database {
             wal: WalHandle::Inline(Mutex::new(Box::new(MemoryBackend::new()))),
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_result_count: DEFAULT_MAX_RESULT_COUNT,
+            #[cfg(feature = "server")]
+            compact_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -304,6 +321,8 @@ impl Database {
             wal: WalHandle::Inline(Mutex::new(Box::new(MemoryBackend::new()))),
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_result_count: DEFAULT_MAX_RESULT_COUNT,
+            #[cfg(feature = "server")]
+            compact_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -343,6 +362,8 @@ impl Database {
             wal: WalHandle::Inline(Mutex::new(Box::new(wal))),
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_result_count: DEFAULT_MAX_RESULT_COUNT,
+            #[cfg(feature = "server")]
+            compact_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -379,7 +400,9 @@ impl Database {
 
         // Spawn the WAL writer task with group commit
         let (tx, rx) = tokio::sync::mpsc::channel(WAL_CHANNEL_SIZE);
-        tokio::spawn(wal_writer_task(wal, rx));
+        let compact_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let max_wal_bytes = config.compaction.max_wal_bytes;
+        tokio::spawn(wal_writer_task(wal, rx, max_wal_bytes, compact_notify.clone()));
 
         let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
             .into_iter()
@@ -392,6 +415,7 @@ impl Database {
             wal: WalHandle::Channel(tx),
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_result_count: DEFAULT_MAX_RESULT_COUNT,
+            compact_notify,
         };
         db.max_document_bytes = config.limits.max_document_bytes;
         db.max_result_count = config.limits.max_result_count;
@@ -402,6 +426,12 @@ impl Database {
     /// Useful for local/read-only workloads that need more than the default 100k cap.
     pub fn set_max_result_count(&mut self, limit: usize) {
         self.max_result_count = limit;
+    }
+
+    /// Returns a Notify that fires when the WAL exceeds its size threshold.
+    #[cfg(feature = "server")]
+    pub fn compact_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.compact_notify.clone()
     }
 
     fn replay_entries(entries: &[WalEntry]) -> Result<HashMap<String, Collection>> {

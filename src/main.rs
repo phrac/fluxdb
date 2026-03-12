@@ -52,7 +52,11 @@ async fn main() {
         eprintln!("Idle timeout:    {}s", config.server.idle_timeout_secs);
     }
     if config.compaction.auto {
-        eprintln!("Auto-compaction: every {}s", config.compaction.interval_secs);
+        eprintln!(
+            "Auto-compaction: every {}s, max WAL {}MB",
+            config.compaction.interval_secs,
+            config.compaction.max_wal_bytes / (1024 * 1024)
+        );
     }
     if config.log.slow_query_ms > 0 {
         eprintln!("Slow query log:  {}ms", config.log.slow_query_ms);
@@ -111,6 +115,7 @@ async fn main() {
     // Optionally start auto-compaction background task
     if config.compaction.auto {
         let compact_db = server.db();
+        let compact_notify = compact_db.compact_notify();
         let interval = std::time::Duration::from_secs(config.compaction.interval_secs);
         let mut compact_shutdown = shutdown_tx.subscribe();
         tokio::spawn(async move {
@@ -118,16 +123,18 @@ async fn main() {
             tick.tick().await; // skip first immediate tick
             loop {
                 tokio::select! {
-                    _ = tick.tick() => {
-                        let db = compact_db.clone();
-                        let result = tokio::task::spawn_blocking(move || db.compact()).await;
-                        match result {
-                            Ok(Ok(())) => eprintln!("fluxdb: auto-compaction completed"),
-                            Ok(Err(e)) => eprintln!("fluxdb: auto-compaction failed: {e}"),
-                            Err(e) => eprintln!("fluxdb: auto-compaction task panic: {e}"),
-                        }
+                    _ = tick.tick() => {}
+                    _ = compact_notify.notified() => {
+                        eprintln!("fluxdb: WAL size threshold exceeded, triggering compaction");
                     }
                     _ = compact_shutdown.recv() => break,
+                }
+                let db = compact_db.clone();
+                let result = tokio::task::spawn_blocking(move || db.compact()).await;
+                match result {
+                    Ok(Ok(())) => eprintln!("fluxdb: auto-compaction completed"),
+                    Ok(Err(e)) => eprintln!("fluxdb: auto-compaction failed: {e}"),
+                    Err(e) => eprintln!("fluxdb: auto-compaction task panic: {e}"),
                 }
             }
         });

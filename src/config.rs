@@ -133,25 +133,33 @@ impl Default for ServerConfig {
 /// Automatic WAL compaction settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionConfig {
-    /// Enable automatic WAL compaction on a timer.
-    #[serde(default)]
+    /// Enable automatic WAL compaction.
+    #[serde(default = "default_compaction_auto")]
     pub auto: bool,
 
     /// Interval between automatic compaction runs, in seconds.
     #[serde(default = "default_compaction_interval_secs")]
     pub interval_secs: u64,
+
+    /// Trigger compaction when the WAL file exceeds this size in bytes.
+    /// Default: 256 MB. Set to 0 to disable size-based compaction.
+    #[serde(default = "default_max_wal_bytes")]
+    pub max_wal_bytes: u64,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         CompactionConfig {
-            auto: false,
+            auto: default_compaction_auto(),
             interval_secs: default_compaction_interval_secs(),
+            max_wal_bytes: default_max_wal_bytes(),
         }
     }
 }
 
+fn default_compaction_auto() -> bool { true }
 fn default_compaction_interval_secs() -> u64 { 3600 }
+fn default_max_wal_bytes() -> u64 { 256 * 1024 * 1024 }
 
 /// Logging and diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -567,6 +575,11 @@ impl Config {
             "# Interval between automatic compaction runs, in seconds.\n\
              interval_secs = {}\n\n",
             self.compaction.interval_secs
+        ));
+        out.push_str(&format!(
+            "# Trigger compaction when WAL exceeds this size in bytes (0 = disabled).\n\
+             max_wal_bytes = {}\n\n",
+            self.compaction.max_wal_bytes
         ));
 
         out.push_str("[redis]\n");
