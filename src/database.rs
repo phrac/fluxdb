@@ -307,8 +307,10 @@ impl Database {
             .to_string();
 
         let wal_path = data_dir.join("wal.log");
-        let entries = Wal::read_all(&wal_path)?;
-        let collections = Self::replay_entries(&entries)?;
+        let mut collections: HashMap<String, Collection> = HashMap::new();
+        Wal::replay_streaming(&wal_path, |op| {
+            Self::replay_op(&mut collections, op);
+        })?;
 
         let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
             .into_iter()
@@ -346,9 +348,10 @@ impl Database {
             .to_string();
 
         let wal_path = data_dir.join("wal.log");
-        let entries = Wal::read_all(&wal_path)?;
-        let next_seq = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
-        let collections = Self::replay_entries(&entries)?;
+        let mut collections: HashMap<String, Collection> = HashMap::new();
+        let next_seq = Wal::replay_streaming(&wal_path, |op| {
+            Self::replay_op(&mut collections, op);
+        })?;
         let wal = Wal::open_at_sequence(&wal_path, next_seq, wal_batch_size, wal_batch_bytes, sync_mode)?;
 
         let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
@@ -387,9 +390,10 @@ impl Database {
             .to_string();
 
         let wal_path = data_dir.join("wal.log");
-        let entries = Wal::read_all(&wal_path)?;
-        let next_seq = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
-        let collections = Self::replay_entries(&entries)?;
+        let mut collections: HashMap<String, Collection> = HashMap::new();
+        let next_seq = Wal::replay_streaming(&wal_path, |op| {
+            Self::replay_op(&mut collections, op);
+        })?;
         let wal = Wal::open_at_sequence(
             &wal_path,
             next_seq,
@@ -486,6 +490,43 @@ impl Database {
         }
 
         Ok(collections)
+    }
+
+    /// Apply a single owned WAL operation to collections (zero-copy for data).
+    fn replay_op(collections: &mut HashMap<String, Collection>, op: WalOperation) {
+        match op {
+            WalOperation::CreateCollection { name } => {
+                collections.insert(name.clone(), Collection::new(name));
+            }
+            WalOperation::DropCollection { name } => {
+                collections.remove(&name);
+            }
+            WalOperation::Insert { collection, doc_id, data } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    col.insert(Document::with_id(doc_id, data));
+                }
+            }
+            WalOperation::Update { collection, doc_id, data } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    let _ = col.update(&doc_id, data);
+                }
+            }
+            WalOperation::Delete { collection, doc_id } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    col.delete(&doc_id);
+                }
+            }
+            WalOperation::CreateIndex { collection, field } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    let _ = col.create_index(&field);
+                }
+            }
+            WalOperation::DropIndex { collection, field } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    let _ = col.drop_index(&field);
+                }
+            }
+        }
     }
 
     /// Create a new collection.

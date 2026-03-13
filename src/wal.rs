@@ -7,7 +7,7 @@ use crate::error::{FluxError, Result};
 #[cfg(feature = "persistence")]
 use std::fs::{self, File, OpenOptions};
 #[cfg(feature = "persistence")]
-use std::io::Write;
+use std::io::{Read as _, Write};
 #[cfg(feature = "persistence")]
 use std::path::{Path, PathBuf};
 
@@ -467,6 +467,99 @@ impl Wal {
         }
 
         Ok(entries)
+    }
+
+    /// Stream-replay a binary WAL file, calling `handler` for each operation.
+    /// Returns the next sequence number. Never allocates the full WAL into memory.
+    ///
+    /// Falls back to `read_all` for legacy JSON WALs (rare, typically small).
+    pub fn replay_streaming<F>(path: &Path, mut handler: F) -> Result<u64>
+    where
+        F: FnMut(WalOperation),
+    {
+        if !path.exists() {
+            return Ok(0);
+        }
+
+        // Peek first byte to detect format
+        let mut file = File::open(path)?;
+        let mut peek = [0u8; 1];
+        let n = file.read(&mut peek)?;
+        if n == 0 {
+            return Ok(0);
+        }
+
+        // Legacy JSON format — fall back to full read (these are typically small)
+        if peek[0] == b'{' {
+            let entries = Self::read_all(path)?;
+            let next_seq = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
+            for entry in entries {
+                handler(entry.operation);
+            }
+            return Ok(next_seq);
+        }
+
+        // Binary format — stream with BufReader
+        use std::io::{BufReader, Seek, SeekFrom};
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        reader.seek(SeekFrom::Start(0))?;
+
+        let mut last_seq = 0u64;
+        let mut has_entries = false;
+        let mut header_buf = [0u8; 4];
+
+        loop {
+            // Read payload length
+            match reader.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+            let payload_len = u32::from_le_bytes(header_buf) as usize;
+
+            if payload_len < 12 {
+                break; // truncated tail
+            }
+
+            // Read the full payload
+            let mut payload = vec![0u8; payload_len];
+            match reader.read_exact(&mut payload) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+
+            let seq = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let op_bytes = &payload[8..payload_len - 4];
+            let stored_crc =
+                u32::from_le_bytes(payload[payload_len - 4..].try_into().unwrap());
+
+            let computed_crc = crc32fast::hash(&payload[0..payload_len - 4]);
+            if computed_crc != stored_crc {
+                eprintln!(
+                    "fluxdb: WAL checksum mismatch at sequence {seq}, \
+                     recovering entries before corruption"
+                );
+                break;
+            }
+
+            let operation = if let Ok(bin_op) = bincode::deserialize::<BinWalOp>(op_bytes) {
+                bin_op.into_op()
+            } else if let Ok(bin_op_v1) = bincode::deserialize::<BinWalOpV1>(op_bytes) {
+                match bin_op_v1.into_op() {
+                    Ok(op) => op,
+                    Err(_) => break,
+                }
+            } else {
+                break;
+            };
+
+            last_seq = seq;
+            has_entries = true;
+            handler(operation);
+        }
+
+        Ok(if has_entries { last_seq + 1 } else { 0 })
     }
 
     /// Read legacy JSON-per-line WAL format (backward compatibility).
