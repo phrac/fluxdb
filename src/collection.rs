@@ -3,10 +3,10 @@ use std::ops::Bound;
 
 use serde_json::Value;
 
-use crate::document::Document;
+use crate::document::{get_nested_field, Document};
 use crate::error::{FluxError, Result};
 use crate::index::{IndexKey, SecondaryIndex};
-use crate::query::{apply_projection, compare_sort_values, matches_filter};
+use crate::query::{apply_projection, compare_sort_values, matches_filter_value};
 
 /// A collection is a named group of documents, analogous to a table in SQL.
 ///
@@ -113,8 +113,13 @@ impl Collection {
 
         let mut ids = Vec::new();
         for doc in iter {
-            if is_match_all || matches_filter(doc, filter)? {
+            if is_match_all {
                 ids.push(doc.id.clone());
+            } else {
+                let data = doc.to_value();
+                if matches_filter_value(&data, filter)? {
+                    ids.push(doc.id.clone());
+                }
             }
         }
         Ok(ids)
@@ -169,13 +174,14 @@ impl Collection {
         };
 
         for doc in iter {
-            if is_match_all || matches_filter(doc, filter)? {
+            let data = doc.to_value();
+            if is_match_all || matches_filter_value(&data, filter)? {
                 if skipped < skip_count {
                     skipped += 1;
                     continue;
                 }
 
-                let mut val = doc.to_value();
+                let mut val = data;
                 if has_projection {
                     apply_projection(&mut val, projection.unwrap())?;
                 }
@@ -217,24 +223,23 @@ impl Collection {
             None => Box::new(self.documents.values()),
         };
 
-        // Collect ALL matching documents — sorting requires the full result set
-        // to be correct. The Database layer caps the effective limit to
-        // max_result_count, which bounds memory use.
-        let mut matched: Vec<&Document> = Vec::new();
+        // Parse each doc once — used for both filtering and sorting.
+        let mut matched: Vec<Value> = Vec::new();
         for doc in iter {
-            if is_match_all || matches_filter(doc, filter)? {
-                matched.push(doc);
+            let data = doc.to_value();
+            if is_match_all || matches_filter_value(&data, filter)? {
+                matched.push(data);
             }
         }
 
         // Parse sort spec: Vec<(field, ascending)>
         let sort_fields = Self::parse_sort_spec(sort_spec)?;
 
-        // Sort
+        // Sort by field values extracted from the pre-parsed Values
         matched.sort_by(|a, b| {
             for (field, ascending) in &sort_fields {
-                let va = a.get_field(field);
-                let vb = b.get_field(field);
+                let va = get_nested_field(a, field);
+                let vb = get_nested_field(b, field);
                 let ord = match (va, vb) {
                     (None, None) => std::cmp::Ordering::Equal,
                     (None, Some(_)) => std::cmp::Ordering::Less,
@@ -254,14 +259,14 @@ impl Collection {
         // Apply skip/limit and projection
         let skip_count = skip.unwrap_or(0);
         let iter = matched.into_iter().skip(skip_count);
-        let iter: Box<dyn Iterator<Item = &Document>> = match limit {
+        let iter: Box<dyn Iterator<Item = Value>> = match limit {
             Some(lim) => Box::new(iter.take(lim)),
             None => Box::new(iter),
         };
 
         let mut results = Vec::new();
-        for doc in iter {
-            let mut val = doc.to_value();
+        for val in iter {
+            let mut val = val;
             if has_projection {
                 apply_projection(&mut val, projection.unwrap())?;
             }
@@ -328,7 +333,10 @@ impl Collection {
         };
 
         for doc in iter {
-            if is_match_all || matches_filter(doc, filter)? {
+            if is_match_all || {
+                let data = doc.to_value();
+                matches_filter_value(&data, filter)?
+            } {
                 if skipped < skip_count {
                     skipped += 1;
                     continue;
@@ -363,7 +371,8 @@ impl Collection {
 
         let mut count = 0;
         for doc in iter {
-            if matches_filter(doc, filter)? {
+            let data = doc.to_value();
+            if matches_filter_value(&data, filter)? {
                 count += 1;
             }
         }

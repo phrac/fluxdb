@@ -116,7 +116,7 @@ impl SecondaryIndex {
 
     /// Add a document to the index.
     pub fn add_doc(&mut self, doc_id: &str, doc: &Document) {
-        if let Some(key) = doc.get_field(&self.field).and_then(IndexKey::from_value) {
+        if let Some(key) = doc.get_field(&self.field).and_then(|v| IndexKey::from_value(&v)) {
             self.tree
                 .entry(key)
                 .or_default()
@@ -126,7 +126,7 @@ impl SecondaryIndex {
 
     /// Remove a document from the index.
     pub fn remove_doc(&mut self, doc_id: &str, doc: &Document) {
-        if let Some(key) = doc.get_field(&self.field).and_then(IndexKey::from_value) {
+        if let Some(key) = doc.get_field(&self.field).and_then(|v| IndexKey::from_value(&v)) {
             if let Some(ids) = self.tree.get_mut(&key) {
                 ids.remove(doc_id);
                 if ids.is_empty() {

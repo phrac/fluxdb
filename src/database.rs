@@ -8,6 +8,8 @@ use crate::document::Document;
 use crate::error::{FluxError, Result};
 use crate::storage::{MemoryBackend, StorageBackend};
 use crate::wal::{WalEntry, WalOperation};
+#[cfg(feature = "persistence")]
+use crate::wal::ReplayOperation;
 
 #[cfg(feature = "persistence")]
 use std::fs;
@@ -308,8 +310,8 @@ impl Database {
 
         let wal_path = data_dir.join("wal.log");
         let mut collections: HashMap<String, Collection> = HashMap::new();
-        Wal::replay_streaming(&wal_path, |op| {
-            Self::replay_op(&mut collections, op);
+        Wal::replay_streaming_raw(&wal_path, |op| {
+            Self::replay_raw_op(&mut collections, op);
         })?;
 
         let wrapped: HashMap<String, Arc<RwLock<Collection>>> = collections
@@ -349,8 +351,8 @@ impl Database {
 
         let wal_path = data_dir.join("wal.log");
         let mut collections: HashMap<String, Collection> = HashMap::new();
-        let next_seq = Wal::replay_streaming(&wal_path, |op| {
-            Self::replay_op(&mut collections, op);
+        let next_seq = Wal::replay_streaming_raw(&wal_path, |op| {
+            Self::replay_raw_op(&mut collections, op);
         })?;
         let wal = Wal::open_at_sequence(&wal_path, next_seq, wal_batch_size, wal_batch_bytes, sync_mode)?;
 
@@ -391,8 +393,8 @@ impl Database {
 
         let wal_path = data_dir.join("wal.log");
         let mut collections: HashMap<String, Collection> = HashMap::new();
-        let next_seq = Wal::replay_streaming(&wal_path, |op| {
-            Self::replay_op(&mut collections, op);
+        let next_seq = Wal::replay_streaming_raw(&wal_path, |op| {
+            Self::replay_raw_op(&mut collections, op);
         })?;
         let wal = Wal::open_at_sequence(
             &wal_path,
@@ -493,6 +495,7 @@ impl Database {
     }
 
     /// Apply a single owned WAL operation to collections (zero-copy for data).
+    #[allow(dead_code)]
     fn replay_op(collections: &mut HashMap<String, Collection>, op: WalOperation) {
         match op {
             WalOperation::CreateCollection { name } => {
@@ -522,6 +525,48 @@ impl Database {
                 }
             }
             WalOperation::DropIndex { collection, field } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    let _ = col.drop_index(&field);
+                }
+            }
+        }
+    }
+
+    /// Fast replay path: document data arrives as pre-serialized JSON bytes.
+    /// Skips BinValue → Value → JSON roundtrip entirely.
+    #[cfg(feature = "persistence")]
+    fn replay_raw_op(collections: &mut HashMap<String, Collection>, op: ReplayOperation) {
+        match op {
+            ReplayOperation::CreateCollection { name } => {
+                collections.insert(name.clone(), Collection::new(name));
+            }
+            ReplayOperation::DropCollection { name } => {
+                collections.remove(&name);
+            }
+            ReplayOperation::Insert { collection, doc_id, raw_json } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    col.insert(Document::from_raw_parts(doc_id, raw_json));
+                }
+            }
+            ReplayOperation::Update { collection, doc_id, raw_json } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    // Update needs to parse the data since set_data takes Value
+                    if let Ok(data) = serde_json::from_slice::<Value>(&raw_json) {
+                        let _ = col.update(&doc_id, data);
+                    }
+                }
+            }
+            ReplayOperation::Delete { collection, doc_id } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    col.delete(&doc_id);
+                }
+            }
+            ReplayOperation::CreateIndex { collection, field } => {
+                if let Some(col) = collections.get_mut(&collection) {
+                    let _ = col.create_index(&field);
+                }
+            }
+            ReplayOperation::DropIndex { collection, field } => {
                 if let Some(col) = collections.get_mut(&collection) {
                     let _ = col.drop_index(&field);
                 }

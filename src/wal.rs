@@ -74,6 +74,21 @@ pub enum WalOperation {
     },
 }
 
+/// A WAL operation where document data is pre-serialized as JSON bytes.
+/// Used by the fast replay path to skip the BinValue → Value → JSON roundtrip.
+#[cfg(feature = "persistence")]
+pub enum ReplayOperation {
+    CreateCollection { name: String },
+    DropCollection { name: String },
+    /// `raw_json` contains the document data as JSON bytes, already including `_id`.
+    Insert { collection: String, doc_id: String, raw_json: Box<[u8]> },
+    /// `raw_json` contains the replacement data as JSON bytes, already including `_id`.
+    Update { collection: String, doc_id: String, raw_json: Box<[u8]> },
+    Delete { collection: String, doc_id: String },
+    CreateIndex { collection: String, field: String },
+    DropIndex { collection: String, field: String },
+}
+
 /// A bincode-friendly representation of a JSON value.
 ///
 /// `serde_json::Value` uses `deserialize_any`, which bincode doesn't support
@@ -138,6 +153,71 @@ impl BinValue {
                 Value::Object(map)
             }
         }
+    }
+
+    /// Serialize directly to JSON bytes, skipping the serde_json::Value intermediate.
+    /// This avoids thousands of tiny heap allocations per document during WAL replay.
+    fn write_json(&self, buf: &mut Vec<u8>) {
+        use std::io::Write;
+        match self {
+            BinValue::Null => buf.extend_from_slice(b"null"),
+            BinValue::Bool(true) => buf.extend_from_slice(b"true"),
+            BinValue::Bool(false) => buf.extend_from_slice(b"false"),
+            BinValue::Int(i) => {
+                write!(buf, "{i}").unwrap();
+            }
+            BinValue::UInt(u) => {
+                write!(buf, "{u}").unwrap();
+            }
+            BinValue::Float(f) => {
+                // Match serde_json's float formatting
+                if f.is_finite() {
+                    let s = serde_json::to_string(
+                        &serde_json::Number::from_f64(*f).unwrap_or_else(|| 0i64.into()),
+                    )
+                    .unwrap();
+                    buf.extend_from_slice(s.as_bytes());
+                } else {
+                    buf.extend_from_slice(b"0");
+                }
+            }
+            BinValue::Str(s) => {
+                // Use serde_json's string escaping for correctness
+                serde_json::to_writer(&mut *buf, s)
+                    .expect("BinValue::write_json: string serialization failed");
+            }
+            BinValue::Array(arr) => {
+                buf.push(b'[');
+                for (i, item) in arr.iter().enumerate() {
+                    if i > 0 {
+                        buf.push(b',');
+                    }
+                    item.write_json(buf);
+                }
+                buf.push(b']');
+            }
+            BinValue::Object(pairs) => {
+                buf.push(b'{');
+                for (i, (key, val)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        buf.push(b',');
+                    }
+                    serde_json::to_writer(&mut *buf, key)
+                        .expect("BinValue::write_json: key serialization failed");
+                    buf.push(b':');
+                    val.write_json(buf);
+                }
+                buf.push(b'}');
+            }
+        }
+    }
+
+    /// Convert directly to JSON byte vector.
+    #[allow(dead_code)]
+    fn to_json_vec(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        self.write_json(&mut buf);
+        buf
     }
 }
 
@@ -230,6 +310,61 @@ impl BinWalOp {
             }
         }
     }
+
+    /// Convert to a ReplayOperation, serializing document data directly to JSON bytes.
+    /// Skips the serde_json::Value intermediate entirely for Insert/Update ops.
+    fn into_replay_op(self) -> ReplayOperation {
+        match self {
+            BinWalOp::CreateCollection { name } => ReplayOperation::CreateCollection { name },
+            BinWalOp::DropCollection { name } => ReplayOperation::DropCollection { name },
+            BinWalOp::Insert { collection, doc_id, data } => {
+                let raw_json = Self::data_to_json_with_id(&doc_id, data);
+                ReplayOperation::Insert { collection, doc_id, raw_json }
+            }
+            BinWalOp::Update { collection, doc_id, data } => {
+                let raw_json = Self::data_to_json_with_id(&doc_id, data);
+                ReplayOperation::Update { collection, doc_id, raw_json }
+            }
+            BinWalOp::Delete { collection, doc_id } => {
+                ReplayOperation::Delete { collection, doc_id }
+            }
+            BinWalOp::CreateIndex { collection, field } => {
+                ReplayOperation::CreateIndex { collection, field }
+            }
+            BinWalOp::DropIndex { collection, field } => {
+                ReplayOperation::DropIndex { collection, field }
+            }
+        }
+    }
+
+    /// Serialize BinValue document data to JSON bytes, injecting `_id` at the start.
+    fn data_to_json_with_id(doc_id: &str, data: BinValue) -> Box<[u8]> {
+        let mut buf = Vec::with_capacity(128);
+        match data {
+            BinValue::Object(pairs) => {
+                buf.push(b'{');
+                // Inject _id first
+                serde_json::to_writer(&mut buf, "_id")
+                    .expect("data_to_json_with_id: key serialization failed");
+                buf.push(b':');
+                serde_json::to_writer(&mut buf, doc_id)
+                    .expect("data_to_json_with_id: id serialization failed");
+                for (key, val) in &pairs {
+                    buf.push(b',');
+                    serde_json::to_writer(&mut buf, key)
+                        .expect("data_to_json_with_id: key serialization failed");
+                    buf.push(b':');
+                    val.write_json(&mut buf);
+                }
+                buf.push(b'}');
+            }
+            other => {
+                // Non-object data — fall back to normal path
+                other.write_json(&mut buf);
+            }
+        }
+        buf.into_boxed_slice()
+    }
 }
 
 #[cfg(feature = "persistence")]
@@ -262,6 +397,57 @@ impl BinWalOpV1 {
                 WalOperation::DropIndex { collection, field }
             }
         })
+    }
+
+    fn into_replay_op(self) -> std::result::Result<ReplayOperation, FluxError> {
+        Ok(match self {
+            BinWalOpV1::CreateCollection { name } => ReplayOperation::CreateCollection { name },
+            BinWalOpV1::DropCollection { name } => ReplayOperation::DropCollection { name },
+            BinWalOpV1::Insert { collection, doc_id, data_json } => {
+                // V1: data_json is already JSON bytes but without _id — we need to inject it
+                let raw_json = inject_id_into_json(&doc_id, &data_json);
+                ReplayOperation::Insert { collection, doc_id, raw_json }
+            }
+            BinWalOpV1::Update { collection, doc_id, data_json } => {
+                let raw_json = inject_id_into_json(&doc_id, &data_json);
+                ReplayOperation::Update { collection, doc_id, raw_json }
+            }
+            BinWalOpV1::Delete { collection, doc_id } => {
+                ReplayOperation::Delete { collection, doc_id }
+            }
+            BinWalOpV1::CreateIndex { collection, field } => {
+                ReplayOperation::CreateIndex { collection, field }
+            }
+            BinWalOpV1::DropIndex { collection, field } => {
+                ReplayOperation::DropIndex { collection, field }
+            }
+        })
+    }
+}
+
+/// Inject an `_id` field into existing JSON object bytes.
+#[cfg(feature = "persistence")]
+fn inject_id_into_json(doc_id: &str, data_json: &[u8]) -> Box<[u8]> {
+    // Fast path: if data starts with '{', insert _id after the opening brace
+    if data_json.first() == Some(&b'{') {
+        let mut buf = Vec::with_capacity(data_json.len() + doc_id.len() + 10);
+        buf.push(b'{');
+        serde_json::to_writer(&mut buf, "_id")
+            .expect("inject_id_into_json: key serialization failed");
+        buf.push(b':');
+        serde_json::to_writer(&mut buf, doc_id)
+            .expect("inject_id_into_json: id serialization failed");
+        if data_json.len() > 2 {
+            // Has fields after '{'
+            buf.push(b',');
+            buf.extend_from_slice(&data_json[1..]); // skip the opening '{'
+        } else {
+            buf.push(b'}');
+        }
+        buf.into_boxed_slice()
+    } else {
+        // Non-object — just return as-is (rare edge case)
+        data_json.to_vec().into_boxed_slice()
     }
 }
 
@@ -547,6 +733,130 @@ impl Wal {
                 bin_op.into_op()
             } else if let Ok(bin_op_v1) = bincode::deserialize::<BinWalOpV1>(op_bytes) {
                 match bin_op_v1.into_op() {
+                    Ok(op) => op,
+                    Err(_) => break,
+                }
+            } else {
+                break;
+            };
+
+            last_seq = seq;
+            has_entries = true;
+            handler(operation);
+        }
+
+        Ok(if has_entries { last_seq + 1 } else { 0 })
+    }
+
+    /// Fast replay that produces `ReplayOperation` with pre-serialized JSON bytes.
+    /// Skips the BinValue → Value → JSON roundtrip — goes BinValue → JSON directly.
+    /// Returns the next sequence number.
+    pub fn replay_streaming_raw<F>(path: &Path, mut handler: F) -> Result<u64>
+    where
+        F: FnMut(ReplayOperation),
+    {
+        if !path.exists() {
+            return Ok(0);
+        }
+
+        // Peek first byte to detect format
+        let mut file = File::open(path)?;
+        let mut peek = [0u8; 1];
+        let n = file.read(&mut peek)?;
+        if n == 0 {
+            return Ok(0);
+        }
+
+        // Legacy JSON format — fall back to full read (these are typically small)
+        if peek[0] == b'{' {
+            let entries = Self::read_all(path)?;
+            let next_seq = entries.last().map(|e| e.sequence + 1).unwrap_or(0);
+            for entry in entries {
+                // Legacy entries come as WalOperation — convert via Value for these few
+                let replay_op = match entry.operation {
+                    WalOperation::CreateCollection { name } => ReplayOperation::CreateCollection { name },
+                    WalOperation::DropCollection { name } => ReplayOperation::DropCollection { name },
+                    WalOperation::Insert { collection, doc_id, data } => {
+                        let mut d = data;
+                        if let Some(obj) = d.as_object_mut() {
+                            obj.insert("_id".to_string(), Value::String(doc_id.clone()));
+                        }
+                        let raw_json = serde_json::to_vec(&d)
+                            .expect("legacy replay: JSON serialization failed")
+                            .into_boxed_slice();
+                        ReplayOperation::Insert { collection, doc_id, raw_json }
+                    }
+                    WalOperation::Update { collection, doc_id, data } => {
+                        let mut d = data;
+                        if let Some(obj) = d.as_object_mut() {
+                            obj.insert("_id".to_string(), Value::String(doc_id.clone()));
+                        }
+                        let raw_json = serde_json::to_vec(&d)
+                            .expect("legacy replay: JSON serialization failed")
+                            .into_boxed_slice();
+                        ReplayOperation::Update { collection, doc_id, raw_json }
+                    }
+                    WalOperation::Delete { collection, doc_id } => {
+                        ReplayOperation::Delete { collection, doc_id }
+                    }
+                    WalOperation::CreateIndex { collection, field } => {
+                        ReplayOperation::CreateIndex { collection, field }
+                    }
+                    WalOperation::DropIndex { collection, field } => {
+                        ReplayOperation::DropIndex { collection, field }
+                    }
+                };
+                handler(replay_op);
+            }
+            return Ok(next_seq);
+        }
+
+        // Binary format — stream with BufReader, produce raw JSON directly
+        use std::io::{BufReader, Seek, SeekFrom};
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        reader.seek(SeekFrom::Start(0))?;
+
+        let mut last_seq = 0u64;
+        let mut has_entries = false;
+        let mut header_buf = [0u8; 4];
+
+        loop {
+            match reader.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+            let payload_len = u32::from_le_bytes(header_buf) as usize;
+
+            if payload_len < 12 {
+                break;
+            }
+
+            let mut payload = vec![0u8; payload_len];
+            match reader.read_exact(&mut payload) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+
+            let seq = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let op_bytes = &payload[8..payload_len - 4];
+            let stored_crc =
+                u32::from_le_bytes(payload[payload_len - 4..].try_into().unwrap());
+
+            let computed_crc = crc32fast::hash(&payload[0..payload_len - 4]);
+            if computed_crc != stored_crc {
+                eprintln!(
+                    "fluxdb: WAL checksum mismatch at sequence {seq}, \
+                     recovering entries before corruption"
+                );
+                break;
+            }
+
+            let operation = if let Ok(bin_op) = bincode::deserialize::<BinWalOp>(op_bytes) {
+                bin_op.into_replay_op()
+            } else if let Ok(bin_op_v1) = bincode::deserialize::<BinWalOpV1>(op_bytes) {
+                match bin_op_v1.into_replay_op() {
                     Ok(op) => op,
                     Err(_) => break,
                 }

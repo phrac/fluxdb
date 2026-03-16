@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-use crate::document::Document;
+use crate::document::{get_nested_field, Document};
 use crate::error::{FluxError, Result};
 
 /// Evaluate whether a document matches a query filter.
@@ -27,6 +27,13 @@ use crate::error::{FluxError, Result};
 /// - `$not`: logical negation (works at both top-level and field-level)
 /// - `$and`, `$or`: logical operators
 pub fn matches_filter(doc: &Document, filter: &Value) -> Result<bool> {
+    let data = doc.to_value();
+    matches_filter_value(&data, filter)
+}
+
+/// Evaluate a filter against a pre-parsed JSON value.
+/// Avoids re-parsing the document for each field access.
+pub fn matches_filter_value(data: &Value, filter: &Value) -> Result<bool> {
     let filter_obj = filter
         .as_object()
         .ok_or_else(|| FluxError::InvalidQuery("filter must be a JSON object".into()))?;
@@ -42,7 +49,7 @@ pub fn matches_filter(doc: &Document, filter: &Value) -> Result<bool> {
                     FluxError::InvalidQuery("$and must be an array".into())
                 })?;
                 for cond in conditions {
-                    if !matches_filter(doc, cond)? {
+                    if !matches_filter_value(data, cond)? {
                         return Ok(false);
                     }
                 }
@@ -53,7 +60,7 @@ pub fn matches_filter(doc: &Document, filter: &Value) -> Result<bool> {
                 })?;
                 let mut any_match = false;
                 for cond in conditions {
-                    if matches_filter(doc, cond)? {
+                    if matches_filter_value(data, cond)? {
                         any_match = true;
                         break;
                     }
@@ -63,12 +70,12 @@ pub fn matches_filter(doc: &Document, filter: &Value) -> Result<bool> {
                 }
             }
             "$not" => {
-                if matches_filter(doc, condition)? {
+                if matches_filter_value(data, condition)? {
                     return Ok(false);
                 }
             }
             field => {
-                let doc_value = doc.get_field(field);
+                let doc_value = get_nested_field(data, field);
                 if !match_field_condition(&doc_value, condition)? {
                     return Ok(false);
                 }
