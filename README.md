@@ -8,15 +8,15 @@ FluxDB stores JSON documents in named collections, supports MongoDB-style querie
 
 ## Performance
 
-Benchmarked against established storage engines on equivalent workloads (10,000 JSON documents, single-threaded, in-memory/WAL mode):
+Benchmarked against established storage engines on equivalent workloads (10,000 JSON documents, single-threaded, in-memory/WAL mode, Apple M2 Pro):
 
-| Operation | FluxDB | SQLite (WAL) | RocksDB | redb | MongoDB |
-|-----------|-------:|-------------:|--------:|-----:|--------:|
-| **Insert** | **2.89 µs** | 12.6 µs | 2.64 µs | 4,317 µs | 56.2 µs |
-| **Get** | **421 ns** | 1,252 ns | 440 ns | 673 ns | 62,235 ns |
-| **Scan 10K** | **26.0 µs** | 1,048 µs | 859 µs | 355 µs | 11,404 µs |
+| Operation | FluxDB | SQLite (WAL) | RocksDB | redb |
+|-----------|-------:|-------------:|--------:|-----:|
+| **Insert** | **3.17 µs** | 12.7 µs | 2.69 µs | 4,821 µs |
+| **Get** | **763 ns** | 1,258 ns | 448 ns | 659 ns |
+| **Scan 10K** | **20.6 µs** | 1,068 µs | 827 µs | 362 µs |
 
-FluxDB's zero-copy scan path is 14x faster than redb and 40x faster than SQLite. Point reads are 3x faster than SQLite, on par with RocksDB. Inserts are 4x faster than SQLite and 19x faster than MongoDB.
+FluxDB's zero-copy scan path is 18x faster than redb, 40x faster than RocksDB, and 52x faster than SQLite. Inserts are 4x faster than SQLite and 1,500x faster than redb. Point reads are 1.6x faster than SQLite; RocksDB is faster for single-key lookups due to its optimized memtable.
 
 ### Concurrency
 
@@ -26,11 +26,11 @@ Benchmark: each thread does the same work, so constant wall time = linear throug
 
 | Threads | Read throughput | Write throughput† |
 |---------|---------------:|------------------:|
-| 1 | 3.9M ops/s (1.0x) | 418K ops/s (1.0x) |
-| 2 | 5.1M ops/s (1.3x) | 579K ops/s (1.4x) |
-| 4 | 7.4M ops/s (1.9x) | 913K ops/s (2.2x) |
+| 1 | 3.0M ops/s (1.0x) | 407K ops/s (1.0x) |
+| 2 | 4.0M ops/s (1.3x) | 650K ops/s (1.6x) |
+| 4 | 6.9M ops/s (2.3x) | 1.17M ops/s (2.9x) |
 
-Reads: `get_by_id` on a shared 10K-document collection. Writes: inserts to per-thread collections (in-memory). Measured on Apple M2 Pro (6P+6E cores). †Server mode with group commit improves write scaling further by eliminating fsync serialization.
+Reads: `get_by_id` on a shared 10K-document collection. Writes: inserts to per-thread collections (in-memory). Measured on Apple M2 Pro. †Server mode with group commit improves write scaling further by eliminating fsync serialization.
 
 Run the benchmarks yourself:
 
@@ -41,7 +41,7 @@ cargo bench --bench engine       # all benchmarks including concurrency
 
 ## Features
 
-- **Document storage** — JSON documents with auto-generated UUIDs or custom IDs
+- **Document storage** — JSON documents with auto-generated UUIDs or custom IDs, bulk delete by filter
 - **Collections** — logical grouping of documents
 - **Query engine** — MongoDB-compatible filter syntax (`$eq`, `$gt`, `$in`, `$or`, `$and`, `$not`, `$exists`, etc.) with dot-notation for nested fields and field-level `$not`
 - **Sort** — `{"sort": {"field": 1}}` for ascending, `-1` for descending, multi-field supported
@@ -313,6 +313,18 @@ The `sort`, `limit`, and `skip` parameters are all optional. Sort values are `1`
 {"cmd": "delete", "collection": "users", "id": "550e8400-..."}
 ```
 
+### Delete documents by filter
+
+```json
+{"cmd": "delete_many", "collection": "users", "filter": {"age": {"$lt": 18}}}
+```
+
+Response:
+
+```json
+{"ok": true, "deleted": 12}
+```
+
 ### Secondary indexes
 
 ```json
@@ -456,6 +468,7 @@ Different operations are handled differently across the cluster:
 | `insert` | **Point route** | If no `_id` is provided, a UUID is generated first so routing is deterministic |
 | `find` | **Scatter-gather** | Sent to all nodes in parallel; results are merged with skip/limit applied after merge |
 | `count` | **Scatter-gather** | Sent to all nodes in parallel; counts are summed |
+| `delete_many` | **Scatter-gather** | Sent to all nodes in parallel; deleted counts are summed |
 | `list_collections` | **Scatter-gather** | Union of collections from all nodes |
 | `create_collection`, `drop_collection` | **Broadcast** | Executed on every node |
 | `create_index`, `drop_index` | **Broadcast** | Executed on every node |
@@ -525,8 +538,8 @@ src/
 ## Testing
 
 ```bash
-cargo test                    # 79 tests (core + server)
-cargo test --features cluster # 89 tests (adds cluster integration)
+cargo test                    # 84 tests (core + server)
+cargo test --features cluster # 94 tests (adds cluster integration)
 ```
 
-Covers documents, queries, projections, sort, field-level `$not`, collections, indexes (including cross-type numeric and `$or`/`$and` index usage), WAL persistence, crash recovery, CRC corruption recovery, atomic compaction, deterministic pagination, concurrent access, input validation, document size limits, config validation, hash ring distribution, and cluster routing.
+Covers documents, queries, projections, sort, field-level `$not`, collections, indexes (including cross-type numeric and `$or`/`$and` index usage), WAL persistence, crash recovery, CRC corruption recovery, atomic compaction, deterministic pagination, concurrent access, input validation, document size limits, delete-by-filter, config validation, hash ring distribution, and cluster routing.
